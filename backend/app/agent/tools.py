@@ -63,15 +63,15 @@ class StringField:
 
     def validate(self, value: Any, key: str) -> str:
         if not isinstance(value, str):
-            raise RequestFault(f"Hibás argumentum: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid argument: {key}", code="INVALID_ARGUMENT")
         if len(value) < self.min_length or len(value) > self.max_length:
-            raise RequestFault(f"Hibás argumentum: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid argument: {key}", code="INVALID_ARGUMENT")
         if self.min_length > 0 and not value.strip():
-            raise RequestFault(f"Hibás argumentum: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid argument: {key}", code="INVALID_ARGUMENT")
         if self.nul_forbidden and "\x00" in value:
-            raise RequestFault(f"Hibás argumentum: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid argument: {key}", code="INVALID_ARGUMENT")
         if self.max_bytes is not None and len(value.encode("utf-8")) > self.max_bytes:
-            raise RequestFault(f"Hibás argumentum: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid argument: {key}", code="INVALID_ARGUMENT")
         return value
 
 
@@ -87,9 +87,9 @@ class IntegerField:
 
     def validate(self, value: Any, key: str) -> int:
         if isinstance(value, bool) or not isinstance(value, int):
-            raise RequestFault(f"Hibás egész szám: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid integer: {key}", code="INVALID_ARGUMENT")
         if value < self.minimum or value > self.maximum:
-            raise RequestFault(f"Hibás egész szám: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid integer: {key}", code="INVALID_ARGUMENT")
         return value
 
 
@@ -105,12 +105,12 @@ class StringArrayField:
 
     def validate(self, value: Any, key: str) -> list[str]:
         if not isinstance(value, list):
-            raise RequestFault(f"Hibás lista: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid list: {key}", code="INVALID_ARGUMENT")
         if len(value) < self.min_items or len(value) > self.max_items:
-            raise RequestFault(f"Hibás lista: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Invalid list: {key}", code="INVALID_ARGUMENT")
         for item in value:
             if not isinstance(item, str) or not self.item_pattern.match(item):
-                raise RequestFault(f"Hibás lista: {key}", code="INVALID_ARGUMENT")
+                raise RequestFault(f"Invalid list: {key}", code="INVALID_ARGUMENT")
         return list(value)
 
 
@@ -160,13 +160,14 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "run_shell": ToolSpec(
         name="run_shell",
         description=(
-            "Parancs futtatása a feladathoz rendelt izolált Linux VM-ben. A fájlok és telepített "
-            "eszközök a VM élettartamán belül megmaradnak; a parancsok önálló shell-folyamatok."
+            "Run a command in the isolated Linux VM assigned to the task. Files and installed "
+            "tools persist for the lifetime of the VM; commands are executed as standalone "
+            "shell processes."
         ),
         fields={
-            "command": _string("Bash parancs", MAX_SCRIPT_CHARS),
+            "command": _string("Bash command", MAX_SCRIPT_CHARS),
             "timeout": _integer(
-                "Végrehajtási határidő másodpercben, alapérték 180, maximum 1800",
+                "Execution timeout in seconds, default 180, maximum 1800",
                 1,
                 MAX_EXECUTION_TIMEOUT_SECONDS,
                 required=False,
@@ -177,13 +178,13 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "run_python": ToolSpec(
         name="run_python",
         description=(
-            "Python 3 program futtatása a feladathoz rendelt Linux VM-ben; a Python értelmező "
-            "változói az új hívások között nem maradnak meg."
+            "Run a Python 3 program in the Linux VM assigned to the task; interpreter state does "
+            "not persist between calls."
         ),
         fields={
-            "code": _string("Python 3 forráskód", MAX_SCRIPT_CHARS),
+            "code": _string("Python 3 source code", MAX_SCRIPT_CHARS),
             "timeout": _integer(
-                "Végrehajtási határidő másodpercben, alapérték 180, maximum 1800",
+                "Execution timeout in seconds, default 180, maximum 1800",
                 1,
                 MAX_EXECUTION_TIMEOUT_SECONDS,
                 required=False,
@@ -194,12 +195,12 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "install_packages": ToolSpec(
         name="install_packages",
         description=(
-            "Nix csomagok telepítése a saját VM-ben. A csomagok elérhetősége a Nix csatornától, "
-            "a hálózattól és a telepítés sikerétől függ."
+            "Install Nix packages in the VM. Package availability depends on the Nix channel, "
+            "network connectivity and installation success."
         ),
         fields={
             "packages": StringArrayField(
-                description="Érvényes nixpkgs attribútumnevek",
+                description="Valid nixpkgs attribute names",
                 min_items=1,
                 max_items=MAX_PACKAGE_COUNT,
                 item_pattern=PACKAGE_PATTERN,
@@ -209,13 +210,13 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "write_file": ToolSpec(
         name="write_file",
         description=(
-            "UTF-8 szöveges fájl atomi írása és SHA-256 ellenőrzése a VM-ben; legfeljebb 128 KiB "
-            "(131072 bájt) UTF-8 kódolásban."
+            "Atomically write a UTF-8 text file and verify its SHA-256 checksum inside the VM; "
+            "up to 128 KiB (131072 bytes) in UTF-8 encoding."
         ),
         fields={
-            "path": _string("Fájl elérési útja", 4096, nul_forbidden=True),
+            "path": _string("File path", 4096, nul_forbidden=True),
             "content": StringField(
-                description="UTF-8 fájl tartalma, lehet üres, legfeljebb 131072 bájt",
+                description="UTF-8 file content, may be empty, maximum 131072 bytes",
                 required=True,
                 min_length=0,
                 max_length=MAX_FILE_BYTES,
@@ -226,13 +227,13 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "read_file": ToolSpec(
         name="read_file",
         description=(
-            "Fájl bájtszintű lapozása; a válasz Base64-kódolt adatot, bytes_read, next_offset és "
-            "eof mezőket tartalmaz. Egy lap 6000 bájt."
+            "Page through a file at the byte level; the reply contains Base64-encoded data, "
+            "bytes_read, next_offset and eof fields. One page is 6000 bytes."
         ),
         fields={
-            "path": _string("Fájl elérési útja", 4096, nul_forbidden=True),
+            "path": _string("File path", 4096, nul_forbidden=True),
             "offset": _integer(
-                "Nemnegatív, biztonságos egész bájteltolás",
+                "Non-negative, safe integer byte offset",
                 0,
                 2**53 - 1,
                 required=False,
@@ -243,40 +244,40 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "expose_port": ToolSpec(
         name="expose_port",
         description=(
-            "A VM-en futó TCP szolgáltatás ellenőrzése és a feladat ideje alatt elérhető InstaVM "
-            "port URL lekérése. A VM a feladat végén megszűnik."
+            "Verify a TCP service running inside the VM and obtain an InstaVM port URL reachable "
+            "for the duration of the task. The VM is destroyed when the task ends."
         ),
         fields={"port": _integer("TCP port", 1, 65535)},
     ),
     "browse_url": ToolSpec(
         name="browse_url",
         description=(
-            "Valódi távoli böngészővel oldal navigálása és tartalmának lekérdezése, az engedélyezett "
-            "HTTPS gazdagépekre korlátozva."
+            "Navigate a page and fetch its content using a real remote browser, restricted to "
+            "allowed HTTPS hosts."
         ),
-        fields={"url": _string("Engedélyezett HTTPS URL", 4096)},
+        fields={"url": _string("Allowed HTTPS URL", 4096)},
     ),
     "update_plan": ToolSpec(
         name="update_plan",
         description=(
-            "A feladat aktuális tervének és mérföldköveinek rögzítése a futó feladat állapotába."
+            "Record the current plan and milestones into the running task state."
         ),
-        fields={"plan": _string("Teljes aktuális terv", MAX_PLAN_LENGTH)},
+        fields={"plan": _string("Full current plan", MAX_PLAN_LENGTH)},
     ),
     "reason": ToolSpec(
         name="reason",
         description=(
-            "Izolált rekurzív következtetés: összetett alproblémát fába bont, ágankénti "
-            "alkérdéseket önállóan megvizsgál és összefoglal, a feladat globális állapotának "
-            "módosítása nélkül."
+            "Isolated recursive reasoning: decompose a complex sub-problem into a tree, examine "
+            "sub-questions per branch independently and summarize them, without modifying the "
+            "global task state."
         ),
         fields={
-            "question": _string("A vizsgálandó összetett kérdés", MAX_REASON_QUESTION),
+            "question": _string("The complex question to investigate", MAX_REASON_QUESTION),
             "depth": _integer(
-                "Rekurziós mélység 1-3", 1, MAX_REASON_DEPTH, required=False, default_value=2
+                "Recursion depth 1-3", 1, MAX_REASON_DEPTH, required=False, default_value=2
             ),
             "branches": _integer(
-                "Ágak száma szintenként 1-3",
+                "Number of branches per level 1-3",
                 1,
                 MAX_REASON_BRANCHES,
                 required=False,
@@ -287,71 +288,70 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "update_state": ToolSpec(
         name="update_state",
         description=(
-            "A munkamemória (Σ) frissítése: tény rögzítése, blokkoló felvétele vagy feloldása, "
-            "részcél lezárása azonosító alapján. Legalább egy nem üres mezőt meg kell adni."
+            "Update the working memory (Σ): record a fact, add or resolve a blocker, mark a "
+            "sub-goal as complete by identifier. You must supply at least one non-empty field."
         ),
         require_any=True,
         fields={
-            "fact": _string("Új ellenőrzött tény", 400, required=False),
-            "blocker": _string("Új blokkoló", 400, required=False),
-            "resolve_blocker": _string("Feloldott blokkoló szövegrészlete", 400, required=False),
-            "complete_subgoal": _string("Lezárt részcél azonosítója", 100, required=False),
+            "fact": _string("New verified fact", 400, required=False),
+            "blocker": _string("New blocker", 400, required=False),
+            "resolve_blocker": _string("Substring of a resolved blocker", 400, required=False),
+            "complete_subgoal": _string("Identifier of completed sub-goal", 100, required=False),
         },
     ),
     "delegate_task": ToolSpec(
         name="delegate_task",
         description=(
-            "Részfeladat kiadása gyors Gemini alügynöknek, amely önállóan kódot futtat, "
-            "Google-ben keres és URL-eket olvas, majd ellenőrzött eredményt ad vissza."
+            "Delegate a sub-task to a fast Gemini sub-agent that can execute code, search Google "
+            "and read URLs autonomously, then returns a verified result."
         ),
         fields={
-            "task": _string("A pontosan megfogalmazott részfeladat", 32_000),
-            "context": _string("A részfeladathoz szükséges háttér", 32_000, required=False),
+            "task": _string("The precisely worded sub-task", 32_000),
+            "context": _string("Background required for the sub-task", 32_000, required=False),
         },
     ),
     "consult_advisor": ToolSpec(
         name="consult_advisor",
         description=(
-            "Erősebb Gemini modell megkérdezése tanácsért: elemzi a helyzetet, hibákat és "
-            "kockázatokat jelez, és konkrét továbblépést javasol."
+            "Consult a stronger Gemini model for advice: analyzes the situation, flags errors and "
+            "risks, and suggests concrete next steps."
         ),
         fields={
-            "question": _string("A tanácsadónak feltett kérdés", 16_000),
-            "context": _string("Az eddigi állapot, próbálkozások és eredmények", 32_000, required=False),
+            "question": _string("The question posed to the advisor", 16_000),
+            "context": _string("Current state, attempts and outcomes so far", 32_000, required=False),
         },
     ),
     "multi_model_consensus": ToolSpec(
         name="multi_model_consensus",
         description=(
-            "Ugyanazt a kérdést több Gemini modell egymástól függetlenül megválaszolja, majd egy "
-            "erős modell összeveti a válaszokat és konszenzust, eltéréseket és bizonyossági "
-            "szintet ad."
+            "Have multiple Gemini models answer the same question independently, then let a "
+            "strong model compare the answers, providing consensus, divergences and confidence."
         ),
         fields={
-            "question": _string("Az elemzendő kérdés", 16_000),
-            "context": _string("Háttérinformáció", 32_000, required=False),
+            "question": _string("The question to be analyzed", 16_000),
+            "context": _string("Background information", 32_000, required=False),
         },
     ),
     "cloud_browser_start": ToolSpec(
         name="cloud_browser_start",
         description=(
-            "Felügyelt Chrome indítása a Browser Use Cloudban proxyval, felvétellel, legfeljebb 4 "
-            "órára. Visszaadja a CDP websocket címet és az élő nézet URL-jét."
+            "Launch a managed Chrome in Browser Use Cloud with proxy and recording, for up to "
+            "4 hours. Returns the CDP websocket address and the live view URL."
         ),
         fields={
-            "country_code": _string("Proxy ország kód, alapértelmezés us", 8, required=False),
+            "country_code": _string("Proxy country code, default us", 8, required=False),
             "timeout_minutes": _integer(
-                "Futási idő percben", 1, 240, required=False, default_value=240
+                "Runtime in minutes", 1, 240, required=False, default_value=240
             ),
         },
     ),
     "cloud_browser_stop": ToolSpec(
         name="cloud_browser_stop",
         description=(
-            "A felhőböngésző leállítása és a felvétel URL-jének lekérése. Minden elindított "
-            "böngészőt állíts le, ha végeztél vele."
+            "Stop the cloud browser and retrieve the recording URL. Shut down every browser you "
+            "started when you're done."
         ),
-        fields={"browser_id": _string("A cloud_browser_start által visszaadott azonosító", 200)},
+        fields={"browser_id": _string("Identifier returned by cloud_browser_start", 200)},
     ),
 }
 
@@ -362,21 +362,21 @@ def is_tool_name(name: str) -> bool:
 
 def validate_arguments(name: str, raw: Any) -> dict[str, Any]:
     if not is_tool_name(name):
-        raise RequestFault("Ismeretlen eszköz.", code="UNKNOWN_TOOL")
+        raise RequestFault("Unknown tool.", code="UNKNOWN_TOOL")
     if not isinstance(raw, dict):
         raise RequestFault(
-            "Az eszköz argumentumainak JSON objektumnak kell lenniük.",
+            "Tool arguments must be a JSON object.",
             code="INVALID_ARGUMENT",
         )
     spec = TOOL_SPECS[name]
     validated: dict[str, Any] = {}
     for key in raw:
         if key not in spec.fields:
-            raise RequestFault(f"Ismeretlen argumentum: {key}", code="INVALID_ARGUMENT")
+            raise RequestFault(f"Unknown argument: {key}", code="INVALID_ARGUMENT")
     for key, field_spec in spec.fields.items():
         if key not in raw:
             if field_spec.required:
-                raise RequestFault(f"Hiányzó argumentum: {key}", code="INVALID_ARGUMENT")
+                raise RequestFault(f"Missing argument: {key}", code="INVALID_ARGUMENT")
             if isinstance(field_spec, IntegerField) and field_spec.default_value is not None:
                 validated[key] = field_spec.default_value
             continue
@@ -395,7 +395,7 @@ def validate_arguments(name: str, raw: Any) -> dict[str, Any]:
                 break
         if not has_value:
             raise RequestFault(
-                "Legalább egy nem üres argumentum megadása kötelező.",
+                "At least one non-empty argument is required.",
                 code="INVALID_ARGUMENT",
             )
     return validated
@@ -466,23 +466,23 @@ def enabled_tool_names(insta_key: str | None, browser_host_count: int) -> list[s
 
 
 def tool_action_text(name: str) -> str:
-    return TOOL_ACTIONS.get(name, "Végrehajtom a következő műveletet.")
+    return TOOL_ACTIONS.get(name, "Executing the next action.")
 
 
 TOOL_ACTIONS: dict[str, str] = {
-    "run_shell": "Parancsot futtatok a virtuális gépen.",
-    "run_python": "Python-műveletet futtatok a virtuális gépen.",
-    "browse_url": "Megnyitom és átnézem a weboldalt.",
-    "cloud_browser_start": "Elindítom a felhőböngészőt.",
-    "cloud_browser_stop": "Leállítom a felhőböngészőt és lekérem a felvételt.",
-    "delegate_task": "Egy segítő modell dolgozik a részfeladaton.",
-    "consult_advisor": "Egy segítő modell véleményét kérem az elakadásról.",
-    "multi_model_consensus": "Összevetem több modell megállapításait.",
-    "write_file": "Elmentem az elkészült fájlt.",
-    "read_file": "Átnézem a fájl tartalmát.",
-    "reason": "Részletesen mérlegelem a következő döntést.",
-    "update_state": "Frissítem a részcélok állapotát.",
-    "update_plan": "Frissítem a munkatervet.",
-    "install_packages": "Telepítem a szükséges programokat.",
-    "expose_port": "Elérhetővé teszem az elkészült szolgáltatást.",
+    "run_shell": "Running a command on the virtual machine.",
+    "run_python": "Executing Python on the virtual machine.",
+    "browse_url": "Opening and reviewing the web page.",
+    "cloud_browser_start": "Starting the cloud browser.",
+    "cloud_browser_stop": "Stopping the cloud browser and retrieving the recording.",
+    "delegate_task": "A helper model is working on the sub-task.",
+    "consult_advisor": "Requesting the opinion of a helper model about the blockage.",
+    "multi_model_consensus": "Comparing the findings of multiple models.",
+    "write_file": "Saving the finished file.",
+    "read_file": "Reviewing the file contents.",
+    "reason": "Deliberating the next decision in detail.",
+    "update_state": "Updating the status of sub-goals.",
+    "update_plan": "Updating the work plan.",
+    "install_packages": "Installing the required programs.",
+    "expose_port": "Making the completed service accessible.",
 }
