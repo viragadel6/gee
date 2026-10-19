@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Optional
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 
@@ -17,7 +16,6 @@ MAX_TIMEOUT_MINUTES = 240
 STOP_POLL_SECONDS = 2
 STOP_DEADLINE_SECONDS = 90
 CONTROL_POLL_SECONDS = 0.7
-DEFAULT_PROXY_COUNTRY_CODE = "us"
 REQUEST_TIMEOUT_SECONDS = 60.0
 CONNECT_TIMEOUT_SECONDS = 10.0
 
@@ -30,47 +28,30 @@ def _api_key() -> str:
     key = get_settings().browser_use_api_key
     if not key:
         raise CloudBrowserError("A BROWSER_USE_API_KEY nincs beállítva.")
-    return key
+    if hasattr(key, "get_secret_value"):
+        key = key.get_secret_value()
+    key_str = str(key).strip()
+    if not key_str:
+        raise CloudBrowserError("A BROWSER_USE_API_KEY nincs beállítva.")
+    return key_str
 
 
-def _browser_path(browser_id: str) -> str:
-    encoded = quote(browser_id, safe="")
-    return f"/{encoded}"
-
-
-def _raise_if_cancelled(cancel: Optional[asyncio.Event]) -> None:
+def _raise_if_cancelled(cancel: asyncio.Event | None) -> None:
     if cancel is not None and cancel.is_set():
         raise asyncio.CancelledError()
 
 
-async def _sleep_unless_cancelled(cancel: asyncio.Event, seconds: float) -> None:
-    if cancel.is_set():
-        return
+async def _sleep_unless_cancelled(seconds: float, cancel: asyncio.Event) -> None:
+    _raise_if_cancelled(cancel)
     try:
         await asyncio.wait_for(cancel.wait(), timeout=seconds)
     except asyncio.TimeoutError:
         return
-
-
-def _normalize_country_code(country_code: Any) -> str:
-    if not isinstance(country_code, str):
-        return DEFAULT_PROXY_COUNTRY_CODE
-    normalized = country_code.strip().lower()
-    return normalized or DEFAULT_PROXY_COUNTRY_CODE
-
-
-def _normalize_timeout(timeout_minutes: Any) -> int:
-    try:
-        minutes = int(timeout_minutes)
-    except (TypeError, ValueError, OverflowError):
-        minutes = MAX_TIMEOUT_MINUTES
-    if minutes <= 0:
-        minutes = MAX_TIMEOUT_MINUTES
-    return min(MAX_TIMEOUT_MINUTES, max(1, minutes))
+    raise asyncio.CancelledError()
 
 
 async def _call(
-    path: str, method: str, body: Any, cancel: Optional[asyncio.Event]
+    path: str, method: str, body: Any, cancel: asyncio.Event | None
 ) -> dict[str, Any]:
     _raise_if_cancelled(cancel)
     headers = {
@@ -80,16 +61,21 @@ async def _call(
     if body is not None:
         headers["Content-Type"] = "application/json"
     timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.request(
-                method, f"{API_URL}{path}", headers=headers, json=body
-            )
-    except httpx.HTTPError as exc:
-        detail = str(exc) or exc.__class__.__name__
-        raise CloudBrowserError(f"Browser Use: {detail}") from exc
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        request = client.build_request(
+            method, f"{API_URL}{path}", headers=headers, json=body
+        )
+        try:
+            response = await client.send(request, stream=True)
+            try:
+                content = await response.aread()
+            finally:
+                await response.aclose()
+        except httpx.HTTPError as exc:
+            detail = str(exc) or exc.__class__.__name__
+            raise CloudBrowserError(f"Browser Use: {detail}") from exc
     _raise_if_cancelled(cancel)
-    text = response.content.decode("utf-8", errors="replace")
+    text = content.decode("utf-8", errors="replace")
     if response.status_code < 200 or response.status_code >= 300:
         raise CloudBrowserError(f"Browser Use ({response.status_code}): {text[:500]}")
     if not text.strip():
@@ -103,13 +89,6 @@ async def _call(
     return parsed
 
 
-async def _stop_quietly(browser_id: str) -> None:
-    try:
-        await _call(_browser_path(browser_id), "PATCH", {"action": "stop"}, None)
-    except Exception:
-        return
-
-
 def _failure(error: BaseException) -> dict[str, Any]:
     message = str(error) or "A felhőböngésző hibával leállt."
     return {
@@ -118,40 +97,72 @@ def _failure(error: BaseException) -> dict[str, Any]:
     }
 
 
+async def _stop_browser_task(browser_task: asyncio.Task[dict[str, Any]]) -> None:
+    try:
+        browser = await browser_task
+        browser_id = str(browser.get("id") or "").strip()
+        if browser_id:
+            await _call(f"/{browser_id}", "PATCH", {"action": "stop"}, None)
+    except Exception:
+        return
+
+
 async def start_cloud_browser(
     country_code: str, timeout_minutes: int, cancel: asyncio.Event
 ) -> dict[str, Any]:
+    creation_task: asyncio.Task[dict[str, Any]] | None = None
     try:
         _raise_if_cancelled(cancel)
-        browser = await _call(
-            "",
-            "POST",
-            {
-                "proxyCountryCode": _normalize_country_code(country_code),
-                "timeout": _normalize_timeout(timeout_minutes),
-                "allowResizing": True,
-                "enableRecording": True,
-                "browserScreenWidth": BROWSER_SCREEN_WIDTH,
-                "browserScreenHeight": BROWSER_SCREEN_HEIGHT,
-            },
-            None,
+        proxy_country = (country_code or "us").strip().lower() or "us"
+        try:
+            timeout_val = int(timeout_minutes)
+        except (TypeError, ValueError, OverflowError):
+            timeout_val = MAX_TIMEOUT_MINUTES
+        if timeout_val <= 0:
+            timeout_val = MAX_TIMEOUT_MINUTES
+        timeout = min(MAX_TIMEOUT_MINUTES, max(1, timeout_val))
+
+        creation_task = asyncio.create_task(
+            _call(
+                "",
+                "POST",
+                {
+                    "proxyCountryCode": proxy_country,
+                    "timeout": timeout,
+                    "allowResizing": True,
+                    "enableRecording": True,
+                    "browserScreenWidth": BROWSER_SCREEN_WIDTH,
+                    "browserScreenHeight": BROWSER_SCREEN_HEIGHT,
+                },
+                None,
+            )
         )
-        browser_id = str(browser.get("id") or "")
+
+        cancellation_task = asyncio.create_task(cancel.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (creation_task, cancellation_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancellation_task in done:
+                raise asyncio.CancelledError()
+            browser = creation_task.result()
+        finally:
+            cancellation_task.cancel()
+
+        browser_id = str(browser.get("id") or "").strip()
         cdp_url = browser.get("cdpUrl")
-        if cancel.is_set():
-            if browser_id:
-                await _stop_quietly(browser_id)
-            raise asyncio.CancelledError()
-        if not browser_id or not isinstance(cdp_url, str) or not cdp_url:
-            if browser_id:
-                await _stop_quietly(browser_id)
+        if not browser_id or not isinstance(cdp_url, str) or not cdp_url.strip():
+            if creation_task is not None:
+                await _stop_browser_task(creation_task)
             raise CloudBrowserError("A böngésző nem adott vissza CDP címet.")
+
         live_url = browser.get("liveUrl")
         return {
             "status": "completed",
             "result": {
                 "browser_id": browser_id,
-                "cdp_url": cdp_url,
+                "cdp_url": cdp_url.strip(),
                 "live_url": live_url if isinstance(live_url, str) and live_url else None,
                 "usage": (
                     "Csatlakozz a VM-ből Playwrighttal: chromium.connect_over_cdp(cdp_url). "
@@ -160,47 +171,53 @@ async def start_cloud_browser(
             },
         }
     except asyncio.CancelledError:
+        if creation_task is not None:
+            await _stop_browser_task(creation_task)
         raise
     except Exception as exc:
+        if creation_task is not None:
+            await _stop_browser_task(creation_task)
         return _failure(exc)
 
 
 async def stop_cloud_browser(browser_id: str, cancel: asyncio.Event) -> dict[str, Any]:
     try:
-        if not isinstance(browser_id, str) or not browser_id.strip():
+        normalized_id = str(browser_id or "").strip()
+        if not normalized_id:
             raise CloudBrowserError("Hiányzik a böngésző azonosítója.")
-        path = _browser_path(browser_id)
-        await _call(path, "PATCH", {"action": "stop"}, None)
+        await _call(f"/{normalized_id}", "PATCH", {"action": "stop"}, None)
         _raise_if_cancelled(cancel)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + STOP_DEADLINE_SECONDS
         while loop.time() < deadline:
-            state = await _call(path, "GET", None, cancel)
+            state = await _call(f"/{normalized_id}", "GET", None, cancel)
             recording_url = state.get("recordingUrl")
-            if isinstance(recording_url, str) and recording_url:
+            if isinstance(recording_url, str) and recording_url.strip():
                 return {
                     "status": "completed",
                     "result": {
-                        "browser_id": browser_id,
+                        "browser_id": normalized_id,
                         "stopped": True,
-                        "recording_url": recording_url,
+                        "recording_url": recording_url.strip(),
                     },
                 }
             if state.get("recordingAvailable") is False:
                 return {
                     "status": "completed",
                     "result": {
-                        "browser_id": browser_id,
+                        "browser_id": normalized_id,
                         "stopped": True,
                         "recording_url": None,
                     },
                 }
-            await _sleep_unless_cancelled(cancel, STOP_POLL_SECONDS)
-            _raise_if_cancelled(cancel)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await _sleep_unless_cancelled(min(float(STOP_POLL_SECONDS), remaining), cancel)
         return {
             "status": "completed",
             "result": {
-                "browser_id": browser_id,
+                "browser_id": normalized_id,
                 "stopped": True,
                 "recording_url": None,
                 "message": "A felvétel még feldolgozás alatt van.",
@@ -213,6 +230,11 @@ async def stop_cloud_browser(browser_id: str, cancel: asyncio.Event) -> dict[str
 
 
 async def register_chat_browser(job_id: str, result: dict[str, Any]) -> str:
+    raw_job_id = str(job_id or "").strip()
+    if not raw_job_id:
+        raise CloudBrowserError("Hiányzik a feladat azonosítója.")
+    if not isinstance(result, dict):
+        raise CloudBrowserError("Érvénytelen böngészőeredmény.")
     raw_browser_id = result.get("browser_id")
     browser_id = str(raw_browser_id).strip() if raw_browser_id is not None else ""
     if not browser_id:
@@ -226,9 +248,9 @@ async def register_chat_browser(job_id: str, result: dict[str, Any]) -> str:
         database.table("chat_browser_sessions")
         .insert(
             {
-                "job_id": job_id,
+                "job_id": raw_job_id,
                 "browser_id": browser_id,
-                "cdp_url": cdp_url,
+                "cdp_url": cdp_url.strip(),
                 "live_url": live_url if isinstance(live_url, str) and live_url else None,
                 "agent_busy": True,
             }
@@ -238,31 +260,38 @@ async def register_chat_browser(job_id: str, result: dict[str, Any]) -> str:
     rows = response.data
     if not isinstance(rows, list) or not rows:
         raise CloudBrowserError("A böngészőnézet mentése sikertelen.")
-    first = rows[0]
-    session_id = first.get("id") if isinstance(first, dict) else None
-    if session_id is None:
+    first_row = rows[0]
+    session_id = first_row.get("id") if isinstance(first_row, dict) else None
+    if session_id is None or not str(session_id).strip():
         raise CloudBrowserError("A böngészőnézet mentése sikertelen.")
-    return str(session_id)
+    return str(session_id).strip()
 
 
 async def wait_for_browser_control(job_id: str, cancel: asyncio.Event) -> None:
+    _raise_if_cancelled(cancel)
+    raw_job_id = str(job_id or "").strip()
+    if not raw_job_id:
+        raise CloudBrowserError("Hiányzik a feladat azonosítója.")
     database = database_module.get_admin_database()
     while not cancel.is_set():
         response = await database.rpc(
-            "claim_chat_browser_step", {"_job_id": job_id}
+            "claim_chat_browser_step", {"_job_id": raw_job_id}
         ).execute()
         if response.data is True:
             return
-        await _sleep_unless_cancelled(cancel, CONTROL_POLL_SECONDS)
+        await _sleep_unless_cancelled(CONTROL_POLL_SECONDS, cancel)
     raise asyncio.CancelledError()
 
 
 async def set_browser_agent_busy(job_id: str, busy: bool) -> None:
+    raw_job_id = str(job_id or "").strip()
+    if not raw_job_id:
+        raise CloudBrowserError("Hiányzik a feladat azonosítója.")
     database = database_module.get_admin_database()
     await (
         database.table("chat_browser_sessions")
-        .update({"agent_busy": busy})
-        .eq("job_id", job_id)
+        .update({"agent_busy": bool(busy)})
+        .eq("job_id", raw_job_id)
         .eq("status", "active")
         .execute()
     )
@@ -270,7 +299,7 @@ async def set_browser_agent_busy(job_id: str, busy: bool) -> None:
         await (
             database.table("chat_browser_sessions")
             .update({"control_mode": "human"})
-            .eq("job_id", job_id)
+            .eq("job_id", raw_job_id)
             .eq("status", "active")
             .eq("control_mode", "requested")
             .execute()
@@ -278,10 +307,13 @@ async def set_browser_agent_busy(job_id: str, busy: bool) -> None:
 
 
 async def mark_chat_browser_stopped(browser_id: str) -> None:
+    raw_browser_id = str(browser_id or "").strip()
+    if not raw_browser_id:
+        raise CloudBrowserError("Hiányzik a böngésző azonosítója.")
     database = database_module.get_admin_database()
     await (
         database.table("chat_browser_sessions")
         .update({"status": "stopped", "control_mode": "agent", "agent_busy": False})
-        .eq("browser_id", browser_id)
+        .eq("browser_id", raw_browser_id)
         .execute()
     )
