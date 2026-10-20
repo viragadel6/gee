@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Coroutine
 
 import httpx
 
@@ -18,6 +18,10 @@ STOP_DEADLINE_SECONDS = 90
 CONTROL_POLL_SECONDS = 0.7
 REQUEST_TIMEOUT_SECONDS = 60.0
 CONNECT_TIMEOUT_SECONDS = 10.0
+
+# Background cleanup tasks are kept here so the event loop cannot garbage
+# collect them while they are still stopping a cloud browser.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
 class CloudBrowserError(RuntimeError):
@@ -48,6 +52,13 @@ async def _sleep_unless_cancelled(seconds: float, cancel: asyncio.Event) -> None
     except asyncio.TimeoutError:
         return
     raise asyncio.CancelledError()
+
+
+def _retain_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
 
 
 async def _call(
@@ -104,6 +115,55 @@ async def _stop_browser_quietly(browser_id: str) -> None:
         return
 
 
+async def _cleanup_created_browser(
+    creation_task: asyncio.Task[dict[str, Any]],
+) -> None:
+    """Stops a browser that was provisioned but must not be used.
+
+    The create request may already have reached the Browser Use API, so the
+    session has to be stopped explicitly - otherwise it keeps running (and
+    billing) until its timeout expires.
+    """
+    try:
+        browser = await creation_task
+    except asyncio.CancelledError:
+        if creation_task.cancelled():
+            return
+        raise
+    except Exception:
+        return
+    browser_id = str(browser.get("id") or "").strip()
+    if browser_id:
+        await _stop_browser_quietly(browser_id)
+
+
+async def _wait_for_cleanup(
+    cleanup_task: asyncio.Task[None],
+) -> asyncio.CancelledError | None:
+    """Waits for the cleanup to finish, even if the caller is cancelled again.
+
+    The cleanup runs in its own task and is awaited through a shield, so a
+    second cancellation cannot interrupt the stop request.  The cancellation
+    itself is remembered and handed back to the caller instead of being
+    swallowed, and - unlike an ``uncancel()``/``cancel()`` round trip - the
+    cancellation state of the calling task is left untouched, so the caller can
+    still run its own cleanup (``finally`` blocks) after the cancellation.
+    """
+    cancellation_error: asyncio.CancelledError | None = None
+
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            if cleanup_task.cancelled():
+                raise
+            if cancellation_error is None:
+                cancellation_error = exc
+
+    cleanup_task.result()
+    return cancellation_error
+
+
 async def start_cloud_browser(
     country_code: str, timeout_minutes: int, cancel: asyncio.Event
 ) -> dict[str, Any]:
@@ -117,40 +177,47 @@ async def start_cloud_browser(
         timeout_val = MAX_TIMEOUT_MINUTES
     timeout = min(MAX_TIMEOUT_MINUTES, max(1, timeout_val))
 
-    creation_task = asyncio.create_task(
-        _call(
-            "",
-            "POST",
-            {
-                "proxyCountryCode": proxy_country,
-                "timeout": timeout,
-                "allowResizing": True,
-                "enableRecording": True,
-                "browserScreenWidth": BROWSER_SCREEN_WIDTH,
-                "browserScreenHeight": BROWSER_SCREEN_HEIGHT,
-            },
-            None,
-        )
-    )
+    creation_task: asyncio.Task[dict[str, Any]] | None = None
+    cancellation_task: asyncio.Task[bool] | None = None
 
     try:
+        creation_task = asyncio.create_task(
+            _call(
+                "",
+                "POST",
+                {
+                    "proxyCountryCode": proxy_country,
+                    "timeout": timeout,
+                    "allowResizing": True,
+                    "enableRecording": True,
+                    "browserScreenWidth": BROWSER_SCREEN_WIDTH,
+                    "browserScreenHeight": BROWSER_SCREEN_HEIGHT,
+                },
+                None,
+            )
+        )
         cancellation_task = asyncio.create_task(cancel.wait())
+
         try:
             done, _ = await asyncio.wait(
                 (creation_task, cancellation_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if cancellation_task in done:
+            # the flag may have been raised in the very same moment the create
+            # response arrived - in that case the session must not be handed
+            # out, it has to be stopped by the cleanup below
+            if cancellation_task in done or cancel.is_set():
                 raise asyncio.CancelledError()
             browser = creation_task.result()
         finally:
             cancellation_task.cancel()
+            await asyncio.gather(cancellation_task, return_exceptions=True)
+
+        _raise_if_cancelled(cancel)
 
         browser_id = str(browser.get("id") or "").strip()
         cdp_url = browser.get("cdpUrl")
         if not browser_id or not isinstance(cdp_url, str) or not cdp_url.strip():
-            if browser_id:
-                await asyncio.shield(_stop_browser_quietly(browser_id))
             raise CloudBrowserError("The browser did not return a CDP URL.")
 
         live_url = browser.get("liveUrl")
@@ -166,32 +233,20 @@ async def start_cloud_browser(
                 ),
             },
         }
-    except asyncio.CancelledError:
+    except BaseException as exc:
+        # the browser may already exist on the Browser Use side: stop it before
+        # the failure is reported
+        if creation_task is not None:
+            cleanup_task = _retain_task(_cleanup_created_browser(creation_task))
+            cleanup_cancelled = await _wait_for_cleanup(cleanup_task)
+            if cleanup_cancelled is not None and isinstance(exc, Exception):
+                raise cleanup_cancelled
 
-        async def _cleanup():
-            try:
-                b = await creation_task
-                bid = str(b.get("id") or "").strip()
-                if bid:
-                    await _stop_browser_quietly(bid)
-            except Exception:
-                pass
+        if isinstance(exc, Exception):
+            _raise_if_cancelled(cancel)
+            return _failure(exc)
 
-        await asyncio.shield(_cleanup())
         raise
-    except Exception as exc:
-
-        async def _cleanup_exc():
-            try:
-                b = await creation_task
-                bid = str(b.get("id") or "").strip()
-                if bid:
-                    await _stop_browser_quietly(bid)
-            except Exception:
-                pass
-
-        await asyncio.shield(_cleanup_exc())
-        return _failure(exc)
 
 
 async def stop_cloud_browser(browser_id: str, cancel: asyncio.Event) -> dict[str, Any]:
@@ -200,36 +255,51 @@ async def stop_cloud_browser(browser_id: str, cancel: asyncio.Event) -> dict[str
         if not normalized_id:
             raise CloudBrowserError("The browser identifier is missing.")
         await _call(f"/{normalized_id}", "PATCH", {"action": "stop"}, None)
-        _raise_if_cancelled(cancel)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + STOP_DEADLINE_SECONDS
-        while loop.time() < deadline:
-            state = await _call(f"/{normalized_id}", "GET", None, cancel)
-            recording_url = state.get("recordingUrl")
-            if isinstance(recording_url, str) and recording_url.strip():
-                return {
-                    "status": "completed",
-                    "result": {
-                        "browser_id": normalized_id,
-                        "stopped": True,
-                        "recording_url": recording_url.strip(),
-                    },
-                }
-            if state.get("recordingAvailable") is False:
-                return {
-                    "status": "completed",
-                    "result": {
-                        "browser_id": normalized_id,
-                        "stopped": True,
-                        "recording_url": None,
-                    },
-                }
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            await _sleep_unless_cancelled(
-                min(float(STOP_POLL_SECONDS), remaining), cancel
-            )
+        try:
+            _raise_if_cancelled(cancel)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + STOP_DEADLINE_SECONDS
+            while loop.time() < deadline:
+                state = await _call(f"/{normalized_id}", "GET", None, cancel)
+                recording_url = state.get("recordingUrl")
+                if isinstance(recording_url, str) and recording_url.strip():
+                    return {
+                        "status": "completed",
+                        "result": {
+                            "browser_id": normalized_id,
+                            "stopped": True,
+                            "recording_url": recording_url.strip(),
+                        },
+                    }
+                if state.get("recordingAvailable") is False:
+                    return {
+                        "status": "completed",
+                        "result": {
+                            "browser_id": normalized_id,
+                            "stopped": True,
+                            "recording_url": None,
+                        },
+                    }
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                await _sleep_unless_cancelled(
+                    min(float(STOP_POLL_SECONDS), remaining), cancel
+                )
+        except asyncio.CancelledError:
+            # The stop request was already accepted, so the browser stops
+            # anyway.  Report it instead of propagating the cancellation: the
+            # runtime stops the remaining browsers in its ``finally`` block and
+            # that cleanup must not be broken by a stale cancellation.
+            return {
+                "status": "completed",
+                "result": {
+                    "browser_id": normalized_id,
+                    "stopped": True,
+                    "recording_url": None,
+                    "message": "The browser was stopped, the recording is still being processed.",
+                },
+            }
         return {
             "status": "completed",
             "result": {
@@ -266,6 +336,8 @@ async def register_chat_browser(job_id: str, result: dict[str, Any]) -> str:
                 "browser_id": browser_id,
                 "cdp_url": cdp_url.strip(),
                 "live_url": live_url if isinstance(live_url, str) and live_url else None,
+                "status": "active",
+                "control_mode": "agent",
                 "agent_busy": True,
             }
         )

@@ -1038,6 +1038,10 @@ class AgentRuntime:
                 }
             )
         finally:
+            # A megszakítás nem szakíthatja meg ezt a takarítást: a felhőböngészőket
+            # minden esetben le kell állítani, különben futnak tovább és számlálnak.
+            # A felfogott megszakítást a blokk végén adjuk tovább.
+            cancellation_error: asyncio.CancelledError | None = None
             progress_task.cancel()
             await asyncio.gather(progress_task, return_exceptions=True)
             slot = self.deliberation
@@ -1047,12 +1051,16 @@ class AgentRuntime:
                 await asyncio.gather(slot.task, return_exceptions=True)
             try:
                 await cloud_browser.set_browser_agent_busy(self.task_id, False)
+            except asyncio.CancelledError as exc:
+                cancellation_error = cancellation_error or exc
             except Exception:
                 pass
             if self.cloud_browsers:
                 if not self.cancel.is_set():
                     try:
                         await cloud_browser.wait_for_browser_control(self.task_id, self.cancel)
+                    except asyncio.CancelledError as exc:
+                        cancellation_error = cancellation_error or exc
                     except Exception:
                         pass
                 for browser_id in list(self.cloud_browsers):
@@ -1063,6 +1071,8 @@ class AgentRuntime:
                         if stopped.get("status") == "completed":
                             self.cloud_browsers.discard(browser_id)
                             await cloud_browser.mark_chat_browser_stopped(browser_id)
+                    except asyncio.CancelledError as exc:
+                        cancellation_error = cancellation_error or exc
                     except Exception:
                         pass
                 if self.cloud_browsers and outcome == TerminalState.COMPLETED:
@@ -1126,6 +1136,8 @@ class AgentRuntime:
                     {"type": "done", "task_id": self.task_id, "outcome": outcome.value}
                 )
                 await self.enqueue("data: [DONE]\n\n")
+            if cancellation_error is not None:
+                raise cancellation_error
         return outcome
 
     async def progress_loop(self) -> None:
