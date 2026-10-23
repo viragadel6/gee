@@ -1397,31 +1397,74 @@ body{ position: fixed; inset: 0; }
   background:rgba(255,255,255,.08);
   font-size:20px;
 }
-.image-flow-reference{
-  display:none;
-  align-items:center;
-  gap:10px;
-  margin-bottom:14px;
-  padding:9px;
-  border:1px solid rgba(255,255,255,.1);
-  border-radius:14px;
-  background:rgba(255,255,255,.04);
-}
-.image-flow-reference.visible{
+.image-flow-references{
   display:flex;
+  flex-wrap:wrap;
+  gap:8px;
 }
-.image-flow-reference img{
-  width:54px;
-  height:54px;
-  border-radius:10px;
+.image-flow-reference-item{
+  position:relative;
+  width:62px;
+  height:62px;
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:12px;
+  overflow:hidden;
+  background:rgba(255,255,255,.05);
+}
+.image-flow-reference-item img{
+  display:block;
+  width:100%;
+  height:100%;
   object-fit:cover;
 }
-.image-flow-reference span{
-  overflow:hidden;
+.image-flow-reference-item button{
+  position:absolute;
+  top:3px;
+  right:3px;
+  width:20px;
+  height:20px;
+  border:0;
+  border-radius:50%;
+  padding:0;
+  color:#fff;
+  font-size:13px;
+  line-height:1;
+  background:rgba(9,11,22,.8);
+  cursor:pointer;
+}
+.image-flow-reference-actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  margin-top:8px;
+}
+.image-flow-chip{
+  min-height:32px;
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:999px;
+  padding:0 12px;
   color:var(--fg2);
   font-size:12px;
-  text-overflow:ellipsis;
-  white-space:nowrap;
+  font-weight:600;
+  background:rgba(255,255,255,.06);
+  cursor:pointer;
+}
+.image-flow-chip:disabled{
+  opacity:.42;
+  cursor:not-allowed;
+}
+.image-flow-count{
+  color:var(--fg);
+  opacity:.6;
+  font-weight:500;
+}
+.image-flow-note{
+  color:var(--fg2);
+  font-size:11.5px;
+  line-height:1.5;
+}
+.image-flow-note:empty{
+  display:none;
 }
 .image-flow-field{
   display:flex;
@@ -1451,6 +1494,30 @@ body{ position: fixed; inset: 0; }
 .image-flow-field select{
   min-height:40px;
   padding:8px 10px;
+}
+.image-flow-option-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(158px,1fr));
+  gap:4px 12px;
+}
+.image-flow-option-grid .image-flow-field{
+  margin:8px 0;
+}
+.image-flow-option-grid .image-flow-field label{
+  display:flex;
+  align-items:center;
+}
+.image-flow-toggle{
+  gap:8px;
+  min-height:40px;
+  padding-top:19px;
+  cursor:pointer;
+}
+.image-flow-toggle input{
+  width:17px;
+  height:17px;
+  accent-color:#7d61ff;
+  cursor:pointer;
 }
 .image-flow-option{
   display:flex;
@@ -6246,27 +6313,47 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
       <h2 id="image-flow-title">Kép létrehozása</h2>
       <button class="image-flow-close" id="image-flow-close" type="button" aria-label="Bezárás">×</button>
     </div>
-    <div class="image-flow-reference" id="image-flow-reference"></div>
-    <div class="image-flow-field">
-      <label for="image-flow-file">Kiinduló kép</label>
-      <input id="image-flow-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
-    </div>
     <div class="image-flow-field">
       <label for="image-flow-prompt" id="image-flow-prompt-label">Írd le a létrehozandó képet</label>
-      <textarea id="image-flow-prompt" maxlength="4000" placeholder="Például: egy napfényes, minimalista kávézó növényekkel, filmes fényekkel"></textarea>
+      <textarea id="image-flow-prompt" maxlength="32000" placeholder="Például: egy napfényes, minimalista kávézó növényekkel, filmes fényekkel"></textarea>
     </div>
     <div class="image-flow-field">
-      <label for="image-flow-size">Képméret</label>
-      <select id="image-flow-size">
-        <option value="1024x1024">Négyzetes</option>
-        <option value="1536x1024">Fekvő</option>
-        <option value="1024x1536">Álló</option>
-      </select>
+      <label for="image-flow-references">Referencia képek <span class="image-flow-count" id="image-flow-reference-count">0 / 14</span></label>
+      <div class="image-flow-references" id="image-flow-references"></div>
+      <div class="image-flow-reference-actions">
+        <button type="button" class="image-flow-chip" id="image-flow-add-file">Kép feltöltése</button>
+        <button type="button" class="image-flow-chip" id="image-flow-add-attached">Csatolt képek</button>
+        <button type="button" class="image-flow-chip" id="image-flow-add-last">Legutóbbi eredmény</button>
+        <button type="button" class="image-flow-chip" id="image-flow-clear-references">Referenciák törlése</button>
+      </div>
+      <input id="image-flow-file" type="file" multiple hidden accept="image/png,image/jpeg,image/webp,image/heic,image/heif,image/gif">
     </div>
-    <div class="image-flow-field">
-      <label for="image-flow-quality">Minőség</label>
-      <select id="image-flow-quality"><option value="low">Alacsony</option><option value="medium" selected>Közepes</option><option value="high">Magas</option></select>
+    <div class="image-flow-option-grid">
+      <div class="image-flow-field">
+        <label for="image-flow-ratio">Képarány</label>
+        <select id="image-flow-ratio"></select>
+      </div>
+      <div class="image-flow-field">
+        <label for="image-flow-resolution">Felbontás</label>
+        <select id="image-flow-resolution"></select>
+      </div>
+      <div class="image-flow-field">
+        <label for="image-flow-count">Képek száma</label>
+        <select id="image-flow-count"></select>
+      </div>
+      <div class="image-flow-field">
+        <label for="image-flow-thinking">Gondolkodás</label>
+        <select id="image-flow-thinking"></select>
+      </div>
+      <div class="image-flow-field">
+        <label for="image-flow-safety">Biztonsági tűrés</label>
+        <select id="image-flow-safety"></select>
+      </div>
+      <div class="image-flow-field">
+        <label class="image-flow-toggle" for="image-flow-websearch"><input id="image-flow-websearch" type="checkbox"><span>Webes keresés a képhez</span></label>
+      </div>
     </div>
+    <div class="image-flow-note" id="image-flow-note"></div>
     <div class="image-flow-actions">
       <button class="image-flow-cancel" id="image-flow-cancel" type="button">Mégse</button>
       <button class="image-flow-submit" id="image-flow-submit" type="button">Kép létrehozása</button>
@@ -6302,7 +6389,45 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
   var clipboardPreviewRenderToken = 0;
   var clipboardPreviewRenderFrame = 0;
   var imageRequestInProgress = false;
-  var imageFlowState = {mode:"generate", image:null, lastFocus:null};
+  var imageFlowState = {mode:"generate", references:[], lastFocus:null};
+  var imageRequestController = null;
+  var imageEditChain = [];
+  var imageModelOptions = null;
+  var imageModelOptionsLoaded = false;
+  var IMAGE_FLOW_SETTINGS_KEY = "image_flow_settings_v2";
+  var MAX_REFERENCE_IMAGES = 14;
+  var MAX_IMAGES_PER_REQUEST = 10;
+  var MAX_REFERENCE_IMAGE_BYTES = 10 * 1000 * 1000;
+  var REFERENCE_IMAGE_MIME_TYPES = {"image/png":true, "image/jpeg":true, "image/webp":true, "image/gif":true, "image/heic":true, "image/heif":true};
+  var ASPECT_RATIO_LABELS = {
+    "auto":"Automatikus",
+    "1:1":"Négyzet (1:1)",
+    "2:3":"Álló (2:3)",
+    "3:2":"Fekvő (3:2)",
+    "3:4":"Álló (3:4)",
+    "4:3":"Fekvő (4:3)",
+    "4:5":"Álló (4:5)",
+    "5:4":"Fekvő (5:4)",
+    "9:16":"Mobil álló (9:16)",
+    "16:9":"Fekvő (16:9)",
+    "21:9":"Széles film (21:9)",
+    "1:4":"Álló sáv (1:4)",
+    "4:1":"Panoráma sáv (4:1)",
+    "1:8":"Keskeny álló sáv (1:8)",
+    "8:1":"Széles sáv (8:1)"
+  };
+  var RESOLUTION_LABELS = {"1K":"1K – gyors", "2K":"2K – részletes", "4K":"4K – maximális"};
+  var THINKING_LABELS = {"minimal":"Minimális – gyors", "medium":"Közepes – alap", "high":"Magas – tervezett"};
+  var SAFETY_LABELS = {"1":"1 – legszigorúbb", "2":"2 – szigorú", "3":"3 – közepes", "4":"4 – alap", "5":"5 – engedékeny", "6":"6 – legengedékenyebb"};
+  var FALLBACK_IMAGE_OPTIONS = {
+    aspect_ratios:["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1"],
+    resolutions:["1K","2K","4K"],
+    thinking_levels:["minimal","medium","high"],
+    safety_tolerances:["1","2","3","4","5","6"],
+    defaults:{aspect_ratio:"auto", resolution:"1K", num_images:1, thinking_level:"medium", enable_web_search:false, safety_tolerance:"4"},
+    limits:{max_reference_images:14, max_images:10, async_num_images_threshold:4},
+    remote_link_hours:24
+  };
   var IMAGE_STORAGE_DATABASE = "chat_image_assets_v2";
   var IMAGE_STORAGE_STORE = "assets";
   var MAX_IMAGE_ATTACHMENT_COUNT = 8;
@@ -7372,21 +7497,238 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
     return result;
   }
 
-  function requestGeneratedImages(prompt, settings){
-    return requestEditedImages(prompt, imageFlowState.image, settings);
+  function imageOptions(){
+    return imageModelOptions || FALLBACK_IMAGE_OPTIONS;
   }
 
-  function requestEditedImages(prompt, reference, settings){
-    return descriptorToFile(reference).then(function(file){
-      return requestImageEndpoint(["/api/images/edits"], function(){
-        var form = new FormData();
-        form.append("image", file, file.name || "image.png");
-        form.append("prompt", prompt);
-        form.append("size", settings.size);
-        form.append("quality", settings.quality);
-        return {method:"POST", credentials:"same-origin", body:form};
+  function imageReferenceLimit(){
+    var limits = imageOptions().limits || {};
+    return Number(limits.max_references || limits.max_reference_images) || MAX_REFERENCE_IMAGES;
+  }
+
+  function imageAsyncThreshold(){
+    var limits = imageOptions().limits || {};
+    return Number(limits.async_num_images_threshold) || 4;
+  }
+
+  function loadImageModelOptions(){
+    if(imageModelOptionsLoaded) return Promise.resolve(imageOptions());
+    imageModelOptionsLoaded = true;
+    return fetch("/api/images/options", {credentials:"same-origin"}).then(function(response){
+      if(!response.ok) throw new Error("A képopciók nem érhetők el.");
+      return response.json();
+    }).then(function(payload){
+      if(payload && Array.isArray(payload.aspect_ratios) && payload.aspect_ratios.length){
+        imageModelOptions = payload;
+        populateImageFlowOptions();
+        applyImageFlowSettings(readImageFlowSettings());
+      }
+      return imageOptions();
+    }).catch(function(){
+      return imageOptions();
+    });
+  }
+
+  function fillImageFlowSelect(elementId, entries, selected){
+    var select = document.getElementById(elementId);
+    if(!select) return;
+    select.innerHTML = "";
+    entries.forEach(function(entry){
+      var option = document.createElement("option");
+      option.value = entry.value;
+      option.textContent = entry.label;
+      select.appendChild(option);
+    });
+    setSelectValue(elementId, selected);
+  }
+
+  function setSelectValue(elementId, value){
+    var select = document.getElementById(elementId);
+    if(!select || value === undefined || value === null) return;
+    var wanted = String(value);
+    var available = Array.prototype.some.call(select.options, function(option){ return option.value === wanted; });
+    if(available) select.value = wanted;
+  }
+
+  function selectValue(elementId, fallback){
+    var select = document.getElementById(elementId);
+    return select && select.value ? select.value : fallback;
+  }
+
+  function populateImageFlowOptions(){
+    var options = imageOptions();
+    var defaults = options.defaults || {};
+    var limits = options.limits || {};
+    var maxImages = Number(limits.max_images) || MAX_IMAGES_PER_REQUEST;
+    var counts = [];
+    for(var index = 1; index <= maxImages; index++) counts.push({value:String(index), label:index === 1 ? "1 kép" : index + " kép"});
+    fillImageFlowSelect("image-flow-ratio", (options.aspect_ratios || []).map(function(value){ return {value:value, label:ASPECT_RATIO_LABELS[value] || value}; }), defaults.aspect_ratio);
+    fillImageFlowSelect("image-flow-resolution", (options.resolutions || []).map(function(value){ return {value:value, label:RESOLUTION_LABELS[value] || value}; }), defaults.resolution);
+    fillImageFlowSelect("image-flow-count", counts, String(defaults.num_images || 1));
+    fillImageFlowSelect("image-flow-thinking", (options.thinking_levels || []).map(function(value){ return {value:value, label:THINKING_LABELS[value] || value}; }), defaults.thinking_level);
+    fillImageFlowSelect("image-flow-safety", (options.safety_tolerances || []).map(function(value){ return {value:value, label:SAFETY_LABELS[value] || value}; }), String(defaults.safety_tolerance || "4"));
+    var webSearch = document.getElementById("image-flow-websearch");
+    if(webSearch) webSearch.checked = !!defaults.enable_web_search;
+  }
+
+  function readImageFlowSettings(){
+    try{
+      var raw = window.localStorage.getItem(IMAGE_FLOW_SETTINGS_KEY);
+      if(!raw) return {};
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    }catch(error){
+      return {};
+    }
+  }
+
+  function saveImageFlowSettings(settings){
+    try{ window.localStorage.setItem(IMAGE_FLOW_SETTINGS_KEY, JSON.stringify(settings || {})); }catch(error){}
+  }
+
+  function currentImageFlowSettings(){
+    var webSearch = document.getElementById("image-flow-websearch");
+    var defaults = imageOptions().defaults || {};
+    var settings = {
+      aspect_ratio: selectValue("image-flow-ratio", defaults.aspect_ratio || "auto"),
+      resolution: selectValue("image-flow-resolution", defaults.resolution || "1K"),
+      num_images: Number(selectValue("image-flow-count", String(defaults.num_images || 1))) || 1,
+      thinking_level: selectValue("image-flow-thinking", defaults.thinking_level || "medium"),
+      safety_tolerance: selectValue("image-flow-safety", String(defaults.safety_tolerance || "4")),
+      enable_web_search: !!(webSearch && webSearch.checked)
+    };
+    if(settings.num_images < 1) settings.num_images = 1;
+    if(settings.num_images > (Number((imageOptions().limits || {}).max_images) || MAX_IMAGES_PER_REQUEST)) settings.num_images = Number((imageOptions().limits || {}).max_images) || MAX_IMAGES_PER_REQUEST;
+    return settings;
+  }
+
+  function applyImageFlowSettings(settings){
+    var values = settings || {};
+    var defaults = imageOptions().defaults || {};
+    setSelectValue("image-flow-ratio", values.aspect_ratio || defaults.aspect_ratio);
+    setSelectValue("image-flow-resolution", values.resolution || defaults.resolution);
+    setSelectValue("image-flow-count", String(values.num_images || defaults.num_images || 1));
+    setSelectValue("image-flow-thinking", values.thinking_level || defaults.thinking_level);
+    setSelectValue("image-flow-safety", String(values.safety_tolerance || defaults.safety_tolerance || "4"));
+    var webSearch = document.getElementById("image-flow-websearch");
+    if(webSearch) webSearch.checked = values.enable_web_search === undefined ? !!defaults.enable_web_search : !!values.enable_web_search;
+    updateImageFlowNote();
+  }
+
+  function updateImageFlowLabels(){
+    var editing = imageFlowReferences().length > 0;
+    var title = document.getElementById("image-flow-title");
+    var promptLabel = document.getElementById("image-flow-prompt-label");
+    var submitButton = document.getElementById("image-flow-submit");
+    if(title) title.textContent = editing ? "Kép szerkesztése" : "Kép létrehozása";
+    if(promptLabel) promptLabel.textContent = editing ? "Írd le a kívánt átalakítást" : "Írd le a létrehozandó képet";
+    if(submitButton && !imageRequestInProgress) submitButton.textContent = editing ? "Kép szerkesztése" : "Kép létrehozása";
+  }
+
+  function updateImageFlowNote(){
+    var note = document.getElementById("image-flow-note");
+    if(!note) return;
+    var settings = currentImageFlowSettings();
+    var threshold = imageAsyncThreshold();
+    var hints = [];
+    if(!imageFlowReferences().length) hints.push("Referencia nélkül új kép készül, referenciákkal a modell szerkeszt és összevon.");
+    else hints.push(imageFlowReferences().length + " referencia képet küldök el (PNG, JPEG, WebP vagy HEIF, képenként legfeljebb 10 MB).");
+    if(settings.resolution === "4K" || settings.num_images > threshold) hints.push("4K felbontás vagy " + (threshold + 1) + " vagy több kép esetén a kérés sorban fut, ezért tovább tarthat.");
+    note.textContent = hints.join(" ");
+  }
+
+  function imageFlowReferences(){
+    if(!imageFlowState || !Array.isArray(imageFlowState.references)) return [];
+    return imageFlowState.references;
+  }
+
+  function createReferenceDescriptorFromFile(file){
+    if(!file || !REFERENCE_IMAGE_MIME_TYPES[String(file.type || "").toLowerCase()]) return Promise.reject(new Error("Csak PNG, JPEG, WebP, HEIF vagy GIF referencia kép használható."));
+    if(file.size > MAX_REFERENCE_IMAGE_BYTES) return Promise.reject(new Error("Egy referencia kép legfeljebb 10 MB lehet."));
+    return readBlobAsDataUrl(file).then(function(dataUrl){
+      return persistImageDescriptor(createImageDescriptor(dataUrl, {
+        name:file.name || "Referencia kép",
+        alt:file.name || "Referencia kép",
+        mimeType:file.type || "image/png",
+        size:file.size || 0,
+        source:"reference"
+      }));
+    });
+  }
+
+  function addImageFlowReferences(descriptors){
+    var list = Array.isArray(descriptors) ? descriptors : [descriptors];
+    if(!imageFlowState || !Array.isArray(imageFlowState.references)) imageFlowState.references = [];
+    var references = imageFlowState.references;
+    var limit = imageReferenceLimit();
+    var added = 0;
+    var duplicates = 0;
+    var overflow = 0;
+    list.forEach(function(descriptor){
+      if(!descriptor || !descriptor.url) return;
+      var image = createImageDescriptor(descriptor.url, descriptor);
+      var duplicate = references.some(function(item){ return item.url === image.url || (item.storageId && item.storageId === image.storageId); });
+      if(duplicate){
+        duplicates += 1;
+        return;
+      }
+      if(references.length >= limit){
+        overflow += 1;
+        return;
+      }
+      references.push(image);
+      added += 1;
+    });
+    renderImageFlowReferences();
+    updateImageFlowNote();
+    if(overflow) toast("Legfeljebb " + limit + " referencia kép használható, ezért " + overflow + " kép kimaradt.", "err");
+    else if(duplicates && !added) toast("Ezek a képek már a referenciák között vannak.", "inf");
+    else if(added) toast(added + " referencia kép hozzáadva.", "ok");
+    return added;
+  }
+
+  function removeImageFlowReference(index){
+    var references = imageFlowReferences();
+    if(!(index >= 0) || index >= references.length) return;
+    references.splice(index, 1);
+    renderImageFlowReferences();
+    updateImageFlowNote();
+  }
+
+  function clearImageFlowReferences(){
+    if(!imageFlowState) return;
+    imageFlowState.references = [];
+    renderImageFlowReferences();
+    updateImageFlowNote();
+  }
+
+  function referenceToFormEntry(descriptor){
+    return hydrateImageDescriptor(descriptor).then(function(hydrated){
+      var url = hydrated && hydrated.url ? hydrated.url : "";
+      if(!url) throw new Error("A referencia kép nem érhető el.");
+      if(!isDataImageUrl(url) && !isImageStorageUrl(url) && /^https?:/i.test(url)) return {url:url};
+      return descriptorToFile(hydrated).then(function(file){ return {file:file}; });
+    });
+  }
+
+  function requestImages(prompt, references, settings){
+    var form = new FormData();
+    form.append("prompt", prompt);
+    form.append("aspect_ratio", settings.aspect_ratio);
+    form.append("resolution", settings.resolution);
+    form.append("num_images", String(settings.num_images));
+    form.append("thinking_level", settings.thinking_level);
+    form.append("safety_tolerance", settings.safety_tolerance);
+    form.append("enable_web_search", settings.enable_web_search ? "true" : "false");
+    return Promise.all((references || []).map(referenceToFormEntry)).then(function(entries){
+      entries.forEach(function(entry){
+        if(entry.file) form.append("image_urls", entry.file, entry.file.name || "reference.png");
+        else if(entry.url) form.append("image_urls", entry.url);
       });
-    }).then(extractGeneratedImageDescriptors);
+      return requestImageEndpoint(["/api/images/generate", "/api/images/edits"], function(){
+        return {method:"POST", credentials:"same-origin", body:form, signal: imageRequestController ? imageRequestController.signal : undefined};
+      });
+    });
   }
 
   function imageContentFromDescriptors(text, descriptors){
@@ -7400,54 +7742,103 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
     var cancelButton = document.getElementById("image-flow-cancel");
     var submitButton = document.getElementById("image-flow-submit");
     if(closeButton) closeButton.disabled = !!value;
-    if(cancelButton) cancelButton.disabled = !!value;
-    if(submitButton){
-      submitButton.disabled = !!value;
-      submitButton.textContent = value ? "Feldolgozás…" : (imageFlowState.mode === "edit" ? "Kép szerkesztése" : "Kép létrehozása");
+    if(cancelButton){
+      cancelButton.disabled = false;
+      cancelButton.textContent = value ? "Megszakítás" : "Mégse";
     }
-  }
-
-  function renderImageFlowReference(descriptor){
-    var reference = document.getElementById("image-flow-reference");
-    if(!reference) return;
-    if(!descriptor || !descriptor.url){
-      reference.classList.remove("visible");
-      reference.innerHTML = "";
+    if(submitButton) submitButton.disabled = !!value;
+    if(value){
+      if(submitButton) submitButton.textContent = "Feldolgozás…";
+      setChipEnabled("image-flow-add-file", false);
+      setChipEnabled("image-flow-add-attached", false);
+      setChipEnabled("image-flow-add-last", false);
+      setChipEnabled("image-flow-clear-references", false);
       return;
     }
-    reference.classList.add("visible");
-    reference.innerHTML = '<img src="' + escapeAttr(descriptor.thumbnailUrl || descriptor.url) + '" alt="' + escapeAttr(descriptor.alt || descriptor.name || "Referencia kép") + '"><span>' + escapeHtml(descriptor.name || "Referencia kép") + '</span>';
+    updateImageFlowLabels();
+    updateImageFlowReferenceButtons();
+  }
+
+  function setChipEnabled(elementId, enabled){
+    var chip = document.getElementById(elementId);
+    if(chip) chip.disabled = !enabled;
+  }
+
+  function renderImageFlowReferences(){
+    var container = document.getElementById("image-flow-references");
+    var counter = document.getElementById("image-flow-reference-count");
+    var references = imageFlowReferences();
+    if(counter) counter.textContent = references.length + " / " + imageReferenceLimit();
+    if(container){
+      container.innerHTML = references.map(function(descriptor, index){
+        return '<span class="image-flow-reference-item"><img src="' + escapeAttr(descriptor.thumbnailUrl || descriptor.url) + '" alt="' + escapeAttr(descriptor.alt || descriptor.name || "Referencia kép") + '"><button type="button" data-reference-index="' + index + '" aria-label="' + (index + 1) + '. referencia törlése">×</button></span>';
+      }).join("");
+      Array.prototype.forEach.call(container.querySelectorAll("[data-reference-index]"), function(button){
+        button.addEventListener("click", function(){ removeImageFlowReference(Number(button.getAttribute("data-reference-index"))); });
+      });
+    }
+    updateImageFlowLabels();
+    updateImageFlowReferenceButtons();
+  }
+
+  function updateImageFlowReferenceButtons(){
+    var references = imageFlowReferences();
+    var atLimit = references.length >= imageReferenceLimit();
+    if(imageRequestInProgress){
+      setChipEnabled("image-flow-add-file", false);
+      setChipEnabled("image-flow-add-attached", false);
+      setChipEnabled("image-flow-add-last", false);
+      setChipEnabled("image-flow-clear-references", false);
+      return;
+    }
+    setChipEnabled("image-flow-add-file", !atLimit);
+    setChipEnabled("image-flow-add-attached", !atLimit && selectedImages.length > 0);
+    setChipEnabled("image-flow-add-last", !atLimit && imageEditChain.length > 0);
+    setChipEnabled("image-flow-clear-references", references.length > 0);
   }
 
   function openImageFlow(mode, descriptor, prompt){
     if(imageRequestInProgress){ toast("A képkérés még folyamatban van.", "inf"); return; }
     var modal = document.getElementById("image-flow-modal");
-    var title = document.getElementById("image-flow-title");
-    var promptLabel = document.getElementById("image-flow-prompt-label");
     var promptInput = document.getElementById("image-flow-prompt");
     if(!modal || !promptInput) return;
-    imageFlowState = {mode:mode === "edit" ? "edit" : "generate", image:descriptor || selectedImages[0] || null, lastFocus:document.activeElement};
+    var references = [];
+    if(Array.isArray(descriptor)) references = descriptor;
+    else if(descriptor && descriptor.url) references = [descriptor];
+    else if(mode === "edit" && selectedImages.length) references = selectedImages.slice(0, imageReferenceLimit());
+    imageFlowState = {
+      mode: mode === "edit" ? "edit" : "generate",
+      references: references.filter(function(item){ return item && item.url; }).map(function(item){ return createImageDescriptor(item.url, item); }),
+      lastFocus: document.activeElement
+    };
     var referenceInput = document.getElementById("image-flow-file");
     if(referenceInput) referenceInput.value = "";
-    if(title) title.textContent = imageFlowState.mode === "edit" ? "Kép szerkesztése" : "Kép létrehozása";
-    if(promptLabel) promptLabel.textContent = imageFlowState.mode === "edit" ? "Írd le a kívánt átalakítást" : "Írd le a létrehozandó képet";
-    promptInput.placeholder = imageFlowState.mode === "edit" ? "Például: cseréld a hátteret alkonyati tengerpartra, tartsd meg az alanyt" : "Például: egy napfényes, minimalista kávézó növényekkel, filmes fényekkel";
-    promptInput.value = prompt || "";
-    renderImageFlowReference(imageFlowState.image);
+    promptInput.placeholder = imageFlowState.references.length
+      ? "Például: cseréld a hátteret alkonyati tengerpartra, tartsd meg az alanyt"
+      : "Például: egy napfényes, minimalista kávézó növényekkel, filmes fényekkel";
+    promptInput.value = prompt || imageFlowState.lastPrompt || "";
+    populateImageFlowOptions();
+    applyImageFlowSettings(readImageFlowSettings());
+    renderImageFlowReferences();
+    updateImageFlowNote();
     modal.classList.add("open");
     modal.setAttribute("aria-hidden", "false");
     setImageFlowBusy(false);
+    loadImageModelOptions();
     window.setTimeout(function(){ promptInput.focus(); }, 0);
   }
 
   function closeImageFlow(force){
     if(imageRequestInProgress && !force) return;
     var modal = document.getElementById("image-flow-modal");
-    if(!modal) return;
-    modal.classList.remove("open");
-    modal.setAttribute("aria-hidden", "true");
-    var previousFocus = imageFlowState.lastFocus;
-    imageFlowState = {mode:"generate", image:null, lastFocus:null};
+    var promptInput = document.getElementById("image-flow-prompt");
+    var previousFocus = imageFlowState ? imageFlowState.lastFocus : null;
+    var lastPrompt = promptInput ? promptInput.value.trim() : "";
+    if(modal){
+      modal.classList.remove("open");
+      modal.setAttribute("aria-hidden", "true");
+    }
+    imageFlowState = {mode:"generate", references:[], lastFocus:null, lastPrompt:lastPrompt};
     if(previousFocus && typeof previousFocus.focus === "function"){
       try{ previousFocus.focus(); }catch(error){}
     }
@@ -7456,58 +7847,112 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
   function submitImageFlow(){
     if(imageRequestInProgress) return;
     var promptInput = document.getElementById("image-flow-prompt");
-    var sizeInput = document.getElementById("image-flow-size");
-    var qualityInput = document.getElementById("image-flow-quality");
     var prompt = promptInput ? promptInput.value.trim() : "";
+    var references = imageFlowReferences().slice();
     if(!prompt){
-      toast(imageFlowState.mode === "edit" ? "Adj meg szerkesztési utasítást." : "Adj meg képgenerálási leírást.", "err");
+      toast(references.length ? "Adj meg szerkesztési utasítást." : "Adj meg képgenerálási leírást.", "err");
       if(promptInput) promptInput.focus();
       return;
     }
-    if(!imageFlowState.image || !imageFlowState.image.url){
-      toast("Válassz ki egy kiinduló képet.", "err");
+    if(references.length > imageReferenceLimit()){
+      toast("Legfeljebb " + imageReferenceLimit() + " referencia kép használható.", "err");
       return;
     }
+    var settings = currentImageFlowSettings();
+    saveImageFlowSettings(settings);
+    var mode = references.length ? "edit" : "generate";
     imageRequestInProgress = true;
     setImageFlowBusy(true);
-    var mode = imageFlowState.mode;
-    var reference = imageFlowState.image;
-    var settings = {size:sizeInput ? sizeInput.value : "1024x1024", quality:qualityInput ? qualityInput.value : "medium"};
     var pendingMessage = {role:"assistant", content:"", isImageRequest:true, imageRequestPending:true, imageOperation:mode, createdAt:Date.now()};
     messages.push(pendingMessage);
     render();
-    var request = mode === "edit" ? requestEditedImages(prompt, reference, settings) : requestGeneratedImages(prompt, settings);
-    request.then(function(descriptors){
-      if(!descriptors.length) throw new Error("A képszolgáltatás nem adott vissza megjeleníthető képet.");
+    imageRequestController = typeof AbortController === "function" ? new AbortController() : null;
+    var startedAt = Date.now();
+    requestImages(prompt, references, settings).then(function(payload){
+      var warnings = payload && Array.isArray(payload.warnings) ? payload.warnings.filter(function(item){ return typeof item === "string" && item; }) : [];
+      return extractGeneratedImageDescriptors(payload).then(function(descriptors){
+        return {descriptors:descriptors, payload:payload, warnings:warnings};
+      });
+    }).then(function(result){
+      if(!result.descriptors.length) throw new Error("A képszolgáltatás nem adott vissza megjeleníthető képet.");
       pendingMessage.imageRequestPending = false;
       pendingMessage.isImageRequest = false;
       pendingMessage.generatedImagePresentation = true;
       pendingMessage.imageOperation = mode;
-      pendingMessage.content = imageContentFromDescriptors(mode === "edit" ? "**Szerkesztett kép**" : "**Generált kép**", descriptors);
+      var description = result.payload && typeof result.payload.description === "string" ? result.payload.description.trim() : "";
+      var price = result.payload && result.payload.calculated_price ? " · költség: $" + result.payload.calculated_price : "";
+      var headline = mode === "edit" ? "**Szerkesztett kép**" : "**Generált kép**";
+      pendingMessage.content = imageContentFromDescriptors(headline + (description ? "\n\n" + description : "") + price, result.descriptors);
+      imageEditChain = result.descriptors.slice();
       persistCurrent();
       render();
       closeImageFlow(true);
-      toast(mode === "edit" ? "A kép elkészült" : "A kép elkészült", "ok");
+      var seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+      toast("A kép elkészült (" + seconds + " mp)", "ok");
+      result.warnings.slice(0, 2).forEach(function(warning){ toast(warning, "inf"); });
+      if(mode === "edit") toast("Az új kép Szerkesztés gombjával folytathatod a módosítást.", "inf");
     }).catch(function(error){
       var index = messages.indexOf(pendingMessage);
       if(index !== -1) messages.splice(index, 1);
       render();
+      if(error && (error.name === "AbortError" || error.message === "A képkérés megszakadt.")){
+        toast("A képkérés megszakadt.", "inf");
+        return;
+      }
       toast(error && error.message ? error.message : "A képkérés sikertelen.", "err");
     }).finally(function(){
       imageRequestInProgress = false;
+      imageRequestController = null;
       setImageFlowBusy(false);
+      updateImageFlowReferenceButtons();
     });
+  }
+
+  function cancelImageFlow(){
+    if(imageRequestInProgress && imageRequestController){
+      imageRequestController.abort();
+      toast("A képkérés megszakítása folyamatban.", "inf");
+      return;
+    }
+    closeImageFlow(false);
   }
 
   function bindImageFlowControls(){
     var referenceInput = document.getElementById("image-flow-file");
     if(referenceInput) referenceInput.addEventListener("change", function(){
-      var file = referenceInput.files && referenceInput.files[0];
-      if(!file) return;
-      createDescriptorFromFile(file).then(function(descriptor){
-        imageFlowState.image = descriptor;
-        renderImageFlowReference(descriptor);
-      }).catch(function(error){ toast(error.message, "err"); });
+      var files = Array.prototype.slice.call(referenceInput.files || []);
+      referenceInput.value = "";
+      if(!files.length) return;
+      Promise.all(files.map(createReferenceDescriptorFromFile)).then(function(descriptors){
+        addImageFlowReferences(descriptors);
+      }).catch(function(error){ toast(error && error.message ? error.message : "A referencia kép nem tölthető be.", "err"); });
+    });
+    var addFileButton = document.getElementById("image-flow-add-file");
+    if(addFileButton) addFileButton.addEventListener("click", function(){
+      if(referenceInput) referenceInput.click();
+    });
+    var addAttachedButton = document.getElementById("image-flow-add-attached");
+    if(addAttachedButton) addAttachedButton.addEventListener("click", function(){
+      if(!selectedImages.length){ toast("Nincs kép csatolva a következő kéréshez.", "inf"); return; }
+      addImageFlowReferences(selectedImages);
+    });
+    var addLastButton = document.getElementById("image-flow-add-last");
+    if(addLastButton) addLastButton.addEventListener("click", function(){
+      if(!imageEditChain.length){ toast("Nincs még korábbi eredmény.", "inf"); return; }
+      addImageFlowReferences(imageEditChain);
+    });
+    var clearReferencesButton = document.getElementById("image-flow-clear-references");
+    if(clearReferencesButton) clearReferencesButton.addEventListener("click", clearImageFlowReferences);
+    ["image-flow-ratio", "image-flow-resolution", "image-flow-count", "image-flow-thinking", "image-flow-safety"].forEach(function(elementId){
+      var select = document.getElementById(elementId);
+      if(select) select.addEventListener("change", function(){
+        saveImageFlowSettings(currentImageFlowSettings());
+        updateImageFlowNote();
+      });
+    });
+    var webSearchToggle = document.getElementById("image-flow-websearch");
+    if(webSearchToggle) webSearchToggle.addEventListener("change", function(){
+      saveImageFlowSettings(currentImageFlowSettings());
     });
     var launch = document.getElementById("btn-attach-generate");
     var upload = document.getElementById("btn-attach-file");
@@ -7611,12 +8056,15 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
       }
     });
     if(close) close.addEventListener("click", function(){ closeImageFlow(false); });
-    if(cancel) cancel.addEventListener("click", function(){ closeImageFlow(false); });
+    if(cancel) cancel.addEventListener("click", cancelImageFlow);
     if(submit) submit.addEventListener("click", submitImageFlow);
     if(prompt) prompt.addEventListener("keydown", function(event){
       if((event.ctrlKey || event.metaKey) && event.key === "Enter"){ event.preventDefault(); submitImageFlow(); }
     });
     if(modal) modal.addEventListener("click", function(event){ if(event.target === modal) closeImageFlow(false); });
+    if(modal) modal.addEventListener("keydown", function(event){
+      if(event.key === "Escape"){ event.preventDefault(); cancelImageFlow(); }
+    });
   }
 
    var lightbox = document.getElementById("media-lightbox");
