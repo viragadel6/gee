@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,8 +24,12 @@ from app.routers import conversations as conversations_router
 from app.routers import images as images_router
 from app.routers import operator as operator_router
 from app.routers import public_worker as public_worker_router
+from app.routers import system as system_router
+from app.services.supervisor import start_supervisor, stop_supervisor, supervisor_status
 
 logger = logging.getLogger("app")
+
+SHUTDOWN_GRACE_SECONDS = 15.0
 
 
 def configure_logging() -> None:
@@ -58,11 +64,25 @@ def resolve_static_directory() -> Path | None:
 
 
 @asynccontextmanager
-async def lifespan(_application: FastAPI):
+async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
     logger.info("application_started")
-    yield
-    await close_databases()
-    logger.info("application_stopped")
+    supervised = False
+    try:
+        supervised = await start_supervisor()
+    except Exception as exc:
+        logger.warning("supervisor_start_failed", extra={"error": str(exc)})
+    try:
+        yield
+    finally:
+        try:
+            if supervised:
+                await asyncio.wait_for(stop_supervisor(), timeout=SHUTDOWN_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("supervisor_stop_timeout")
+        except Exception as exc:
+            logger.warning("supervisor_stop_failed", extra={"error": str(exc)})
+        await close_databases()
+        logger.info("application_stopped")
 
 
 def create_app() -> FastAPI:
@@ -98,12 +118,35 @@ def create_app() -> FastAPI:
     app.include_router(browser_router.router)
     app.include_router(images_router.router)
     app.include_router(public_worker_router.router)
+    app.include_router(system_router.router)
 
     @app.get("/api/health")
     async def health() -> JSONResponse:
+        status = supervisor_status()
+        degraded = [
+            name
+            for name, breaker in (status.get("breakers") or {}).items()
+            if isinstance(breaker, dict) and breaker.get("state") == "open"
+        ]
+        stalled = bool(status.get("enabled")) and not bool(status.get("running"))
+        healthy = not degraded and not stalled
+        body = {
+            "status": "ok" if healthy else "degraded",
+            "service": "chat-pal-backend",
+            "supervisor": {
+                "enabled": status.get("enabled"),
+                "running": status.get("running"),
+                "leader": status.get("leader"),
+                "owner_id": status.get("owner_id"),
+                "consecutive_failures": status.get("consecutive_failures"),
+                "last_error": status.get("last_error"),
+                "open_breakers": degraded,
+                "last_sweep_at": (status.get("metrics") or {}).get("last_sweep_at"),
+            },
+        }
         return JSONResponse(
             status_code=200,
-            content={"status": "ok", "service": "chat-pal-backend"},
+            content=body,
             headers={"Cache-Control": "no-store"},
         )
 

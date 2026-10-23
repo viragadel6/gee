@@ -26,11 +26,46 @@ class Settings(BaseSettings):
     browser_use_api_key: str = ""
     gemini_api_key: str = ""
     flymyai_api_key: str = ""
+    flymyai_base_url: str = "https://api.flymy.ai"
+    flymyai_image_model: str = "flymyai/nano-banana-2_1"
 
     model_name: str = "tencent/hy4-preview-free"
+    model_fallback_names: str = ""
+    model_retry_max: int = 4
+    model_stream_retry_max: int = 2
     orcarouter_url: str = "https://api.orcarouter.ai/v1/chat/completions"
     instavm_url: str = "https://api.instavm.io"
     published_origin: str = "https://chat-pal-deploy.lovable.app"
+
+    supervisor_enabled: bool = True
+    supervisor_interval_ms: int = 15_000
+    supervisor_leader_lease_ms: int = 45_000
+    supervisor_stale_queued_ms: int = 45_000
+    supervisor_stuck_progress_ms: int = 900_000
+    supervisor_orphan_browser_ms: int = 240_000
+    supervisor_probe_timeout_ms: int = 8_000
+    supervisor_backoff_max_ms: int = 300_000
+    supervisor_batch_size: int = 25
+    supervisor_recovery_log_limit: int = 400
+    supervisor_breaker_threshold: int = 4
+    supervisor_breaker_cooldown_ms: int = 120_000
+
+    chat_job_max_attempts: int = 4
+    chat_job_retry_base_ms: int = 5_000
+    chat_job_retry_max_ms: int = 300_000
+    chat_job_sink_retry_max: int = 6
+    chat_job_sink_buffer_max: int = 400
+    chat_job_event_buffer_max: int = 200
+
+    agent_checkpoint_enabled: bool = True
+    agent_checkpoint_interval_steps: int = 4
+    agent_checkpoint_max_bytes: int = 262_144
+    agent_step_retry_max: int = 3
+    agent_loop_repeat_limit: int = 3
+    agent_sandbox_recreate_max: int = 2
+    agent_sandbox_probe_interval_steps: int = 20
+    agent_soft_deadline_margin_ms: int = 240_000
+    agent_uncertainty_limit: int = 3
 
     chat_deployment_max_request_ms: str = ""
     chat_sandbox_allowed_domains: str = ""
@@ -45,4 +80,3 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-
