@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import os
+import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
@@ -29,8 +33,13 @@ from app.errors import (
     StepLimitFault,
     ToolUncertainFault,
 )
-from app.models import RuntimeConfig, TerminalState, ToolOutput, ToolStatus
+from app.models import ModelResponse, RuntimeConfig, TerminalState, ToolCall, ToolOutput, ToolStatus
+from app.services import checkpoints
+from app.services.checkpoints import CHECKPOINT_VERSION, Checkpoint, LedgerEntry, PendingCall
+from app.utils.clock import as_dict, as_list, as_str
 from app.utils.security import host_list
+
+logger = logging.getLogger("app.runtime")
 
 MAX_STEPS = 600
 MAX_TOOL_CALLS = 600
@@ -42,6 +51,16 @@ COMPACT_MIN_BYTES = 2_000
 COMPACT_PREVIEW_CHARS = 600
 CONSOLIDATION_TIMEOUT_MS = 120_000
 PROGRESS_INTERVAL_SECONDS = 15
+WRAP_UP_TIMEOUT_SECONDS = 120
+BACKOFF_BASE_SECONDS = 1.5
+BACKOFF_MAX_SECONDS = 45.0
+RATE_LIMIT_BACKOFF_SECONDS = 30.0
+TRACE_MEMORY = 400
+TRACE_COMPACT_CHARS = 600
+RECENT_FINGERPRINTS = 32
+LEDGER_LIMIT = 64
+ADVICE_CHARS = 4000
+SUMMARY_CHARS = 6000
 NIX_EGRESS_DOMAINS = (
     "releases.nixos.org",
     "cache.nixos.org",
@@ -65,6 +84,60 @@ PHASE_ACTIVITIES = {
     "osReflect": "Megvizsgálom az elakadást és a javítás lehetőségét.",
     "osConsolidate": "Lezárom a munkát és elmentem a tapasztalatokat.",
 }
+RESTART_SEPARATOR = "\n\n── A modell adatfolyama megszakadt, a gondolatmenet folytatódik ──\n\n"
+MODEL_RETRY_CODES = frozenset(
+    {
+        "MODEL_TIMEOUT",
+        "MODEL_TRANSPORT",
+        "MODEL_HTTP",
+        "MODEL_RATE_LIMIT",
+        "MODEL_ERROR",
+        "MODEL_INCOMPLETE",
+        "MODEL_PROTOCOL",
+        "MODEL_ENCODING",
+        "MODEL_RETRIES_EXHAUSTED",
+        "MODEL_TRUNCATED",
+        "STREAM_TOO_LARGE",
+        "EMPTY_ANSWER",
+        "PROTOCOL_ERROR",
+    }
+)
+MODEL_LONG_BACKOFF_CODES = frozenset({"MODEL_RATE_LIMIT", "MODEL_TIMEOUT", "MODEL_RETRIES_EXHAUSTED"})
+SANDBOX_RETRY_CODES = frozenset(
+    {
+        "SESSION_TERMINATED",
+        "PROVIDER_HTTP",
+        "PROVIDER_RATE_LIMIT",
+        "PROVIDER_TRANSPORT",
+        "UNKNOWN_OUTCOME",
+        "EXECUTION_UNKNOWN",
+        "CLEANUP_FAILED",
+    }
+)
+SANDBOX_FATAL_CODES = frozenset({"PROVIDER_AUTH", "PROVIDER_REJECTED", "SANDBOX_DISABLED"})
+IDEMPOTENT_TOOLS = frozenset({"read_file", "browse_url"})
+FATAL_CODES = frozenset(
+    {
+        "CANCELLED",
+        "STEP_LIMIT",
+        "MODEL_AUTH",
+        "MODEL_REFUSAL",
+        "MODEL_FILTERED",
+        "MODEL_FINISH_UNSUPPORTED",
+        "MODEL_OUTPUT_LIMIT",
+        "UNSUPPORTED_MODEL_CONTENT",
+        "CONFIGURATION",
+        "DEPLOYMENT_UNSUPPORTED",
+        "UNKNOWN_TOOL",
+        "INVALID_ARGUMENT",
+        "TOOL_UNCERTAIN",
+    }
+)
+WRAP_UP_SYSTEM = (
+    "Összefoglaló író vagy. A futásidő vagy a lépéskeret lejárt, ezért a felhasználónak "
+    "magyar nyelvű, tényszerű zárójelentést adsz. Nem ígérsz olyat, ami nem készült el. "
+    "Nem használsz eszközöket."
+)
 
 Sender = Callable[[dict[str, Any]], Awaitable[None]]
 Enqueuer = Callable[[str], Awaitable[None]]
@@ -118,6 +191,7 @@ def required_environment() -> RuntimeConfig:
 
 def system_prompt(enabled: list[str], plan: str, started_at: str, cognition: str = "") -> str:
     current = datetime.now(UTC).isoformat()
+
     def has(name: str) -> bool:
         return name in enabled
 
@@ -169,6 +243,12 @@ def system_prompt(enabled: list[str], plan: str, started_at: str, cognition: str
             "Nem érhető el Linux VM, Python, fájlrendszer, InstaVM böngésző vagy porttovábbítás; "
             "kizárólag a fent felsorolt eszközöket használhatod."
         )
+    lines.append(
+        "Önjavítás: a rendszer a háttérben mentési pontot készít, átmeneti hiba esetén újrapróbálja "
+        "a lépést, és szükség esetén új VM-et indít. Ha a rendszerüzenetek ilyen beavatkozást "
+        "jeleznek, előbb ellenőrizd az állapotot read-only művelettel, és csak ezután folytasd; "
+        "a már sikeresen elvégzett műveleteket ne ismételd meg."
+    )
     return "\n".join(line for line in lines if line)
 
 
@@ -191,6 +271,9 @@ class ContextBudget:
         for message in messages:
             total += self.size(message)
         return total
+
+    def forget(self, message: dict[str, Any]) -> None:
+        self._sizes.pop(id(message), None)
 
 
 def compact_text(text: str) -> str:
@@ -255,6 +338,7 @@ def compact(messages: list[dict[str, Any]], budget: ContextBudget, objective_ind
         removed = messages[1:next_user]
         del messages[1:next_user]
         for message in removed:
+            budget.forget(message)
             total -= budget.size(message)
         objective_index -= len(removed)
     if total <= MAX_CONTEXT_BYTES:
@@ -273,6 +357,7 @@ def compact(messages: list[dict[str, Any]], budget: ContextBudget, objective_ind
         if shrunk is None:
             return
         total += budget.size(shrunk) - budget.size(message)
+        budget.forget(message)
         messages[index] = shrunk
 
     for index in range(start, recent_start):
@@ -294,10 +379,79 @@ def compact(messages: list[dict[str, Any]], budget: ContextBudget, objective_ind
         removed = messages[start:recent_start]
         messages[start:recent_start] = [marker]
         for message in removed:
+            budget.forget(message)
             total -= budget.size(message)
         total += budget.size(marker)
     if total > MAX_CONTEXT_BYTES:
         raise ContextLimitFault()
+
+
+def digest_message(message: dict[str, Any], limit: int = 240) -> str:
+    role = as_str(message.get("role")) or "ismeretlen"
+    content = as_str(message.get("content"))
+    calls = as_list(message.get("tool_calls"))
+    if calls:
+        names = [as_str(as_dict(as_dict(call).get("function")).get("name")) for call in calls]
+        listed = ", ".join(name for name in names if name) or "eszközhívás"
+        return f"{role}: {listed} → {content[:limit]}"
+    return f"{role}: {content[:limit]}"
+
+
+def compact_aggressive(
+    messages: list[dict[str, Any]],
+    budget: ContextBudget,
+    objective_index: int,
+    trace: list[str],
+) -> tuple[int, int]:
+    if len(messages) <= 3:
+        return budget.total(messages), -1
+    keep = max(2, COMPACT_KEEP_RECENT_MESSAGES)
+    recent_start = max(1, len(messages) - keep)
+    while recent_start > 1 and messages[recent_start].get("role") == "tool":
+        recent_start -= 1
+    objective_at = objective_index if 0 < objective_index < recent_start else -1
+    if objective_at >= 0 and messages[objective_at].get("role") != "user":
+        objective_at = -1
+    dropped = [
+        message
+        for index, message in enumerate(messages)
+        if 0 < index < recent_start and index != objective_at
+    ]
+    if not dropped:
+        return budget.total(messages), -1
+    trace_lines = [f"- {item[:TRACE_COMPACT_CHARS]}" for item in trace[-12:]] or [
+        "- nincs rögzített nyomvonal"
+    ]
+    summary_lines = [f"- {digest_message(message)}" for message in dropped[-24:]]
+    marker = {
+        "role": "user",
+        "content": "\n".join(
+            [
+                f"[Rendszerüzenet] {len(dropped)} korábbi üzenet a kontextuskeret miatt "
+                "összefoglalásra került. A terv és a munkamemória a rendszerüzenetben van.",
+                "ÖSSZEFOGLALT LÉPÉSEK:",
+                *summary_lines,
+                "NYOMVONAL VÉGE:",
+                *trace_lines,
+            ]
+        ),
+    }
+    head: list[dict[str, Any]] = [messages[0]]
+    if objective_at >= 0:
+        head.append(messages[objective_at])
+    for message in dropped:
+        budget.forget(message)
+    messages[:] = [*head, marker, *messages[recent_start:]]
+    digest_index = len(head)
+    if budget.total(messages) > MAX_CONTEXT_BYTES:
+        for index in range(digest_index + 1, len(messages)):
+            shrunk = shrink_message(messages[index], True)
+            if shrunk is not None:
+                budget.forget(messages[index])
+                messages[index] = shrunk
+            if budget.total(messages) <= MAX_CONTEXT_BYTES:
+                break
+    return budget.total(messages), digest_index
 
 
 @dataclass
@@ -321,12 +475,48 @@ def format_reflection(reflection: cog.Reflection) -> str:
     )
 
 
+def status_or_unknown(value: str) -> ToolStatus:
+    try:
+        return ToolStatus(value)
+    except ValueError:
+        return ToolStatus.UNKNOWN
+
+
 def _browser_id_from(output: ToolOutput) -> str | None:
     for key in ("browser_id", "id", "session_id"):
         value = output.result.get(key)
         if isinstance(value, str) and value.strip():
             return value
     return None
+
+
+class DeltaGate:
+    def __init__(self) -> None:
+        self.sent = 0
+        self.attempt = 0
+        self.restarts = 0
+        self.separator_pending = False
+        self.interrupted = False
+
+    def begin_attempt(self) -> None:
+        if self.interrupted and self.sent:
+            self.restarts += 1
+            self.separator_pending = True
+        self.interrupted = False
+        self.attempt = 0
+
+    def mark_interrupted(self) -> None:
+        self.interrupted = True
+
+    def slice(self, text: str) -> str:
+        if not text:
+            return ""
+        self.attempt += len(text)
+        if self.attempt <= self.sent:
+            return ""
+        keep = self.attempt - self.sent
+        self.sent = self.attempt
+        return text[-keep:] if keep < len(text) else text
 
 
 class AgentRuntime:
@@ -338,7 +528,8 @@ class AgentRuntime:
         send: Sender,
         enqueue: Enqueuer,
         cancel: asyncio.Event,
-    ):
+        checkpoint: Checkpoint | None = None,
+    ) -> None:
         self.task_id = task_id
         self.config = config
         self.history = history
@@ -375,6 +566,29 @@ class AgentRuntime:
         self.verified = False
         self.failure_reason = ""
         self.lifecycle = cog.Lifecycle(self.on_phase_change)
+        self.gate = DeltaGate()
+        self.recent: deque[str] = deque(maxlen=RECENT_FINGERPRINTS)
+        self.step_ledger: dict[str, LedgerEntry] = {}
+        self.ledger_order: list[str] = []
+        self.pending_response: ModelResponse | None = None
+        self.step_appended = False
+        self.step_retries = 0
+        self.sandbox_recreations = 0
+        self.sandbox_faults = 0
+        self.loop_strikes = 0
+        self.uncertainty_strikes = 0
+        self.context_recoveries = 0
+        self.model_failures = 0
+        self.advisor_calls = 0
+        self.last_fault_code = ""
+        self.fault_repeats = 0
+        self.last_checkpoint_step = -1
+        self.resumed = False
+        self.wrapped_up = False
+        self.knowledge = ""
+        self.checkpoint = checkpoint
+        self.appended_results: set[str] = set()
+        self.progress_ticks = 0
 
     async def on_phase_change(self, from_phase: str, to_phase: str) -> None:
         self.current_activity = PHASE_ACTIVITIES.get(to_phase, self.current_activity)
@@ -383,6 +597,11 @@ class AgentRuntime:
 
     def trace_text(self) -> str:
         return "\n".join(self.trace[-20:])
+
+    def append_trace(self, entry: str) -> None:
+        self.trace.append(entry)
+        if len(self.trace) > TRACE_MEMORY:
+            del self.trace[: len(self.trace) - TRACE_MEMORY]
 
     def remaining(self) -> float:
         if self.cancel.is_set():
@@ -415,6 +634,26 @@ class AgentRuntime:
                 "event": {"type": "cognitive_note", "label": label, "detail": detail},
             }
         )
+
+    async def heal_note(self, label: str, detail: str) -> None:
+        self.append_trace(f"ÖNJAVÍTÁS [{label}]: {detail[:TRACE_COMPACT_CHARS]}")
+        if self.cancel.is_set():
+            return
+        try:
+            await self.send(
+                {
+                    "type": "agent_event",
+                    "task_id": self.task_id,
+                    "step": self.steps,
+                    "event": {"type": "self_heal", "label": label, "detail": detail},
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "heal_note_failed", extra={"job_id": self.task_id, "error": str(exc)}
+            )
 
     async def make_think(self, cancel: asyncio.Event, visible: bool, deadline: float) -> cog.Think:
         async def think(system: str, user: str) -> str:
@@ -469,8 +708,10 @@ class AgentRuntime:
                 slot.value = await cog.deliberate(think, self.sigma, self.trace_text(), knowledge)
             except asyncio.CancelledError:
                 pass
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "deliberation_failed", extra={"job_id": self.task_id, "error": str(exc)}
+                )
             finally:
                 slot.done = True
 
@@ -505,6 +746,51 @@ class AgentRuntime:
         await self.apply_deliberation(True)
         await self.start_deliberation(knowledge)
         await self.apply_deliberation(True)
+
+    async def safe_reflect(self, failed_action: str, extra: str = "") -> cog.Reflection:
+        context = "\n".join(item for item in (self.trace_text(), extra) if item)
+        for attempt in range(2):
+            try:
+                think = await self.make_think(self.cancel, True, self.deadline)
+                return await cog.reflect(think, self.objective, context, failed_action)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "reflection_failed",
+                    extra={"job_id": self.task_id, "attempt": attempt + 1, "error": str(exc)},
+                )
+                await self.sleep_backoff(attempt + 1, "REFLECTION_RETRY")
+        return cog.Reflection(
+            failure_point=failed_action[:400],
+            component="executor",
+            root_cause=(
+                "A hibaelemző nem adott használható választ, ezért determinisztikus korrekció "
+                "lép életbe: az ismétlődő vagy sikertelen művelet nem folytatható változtatás nélkül."
+            ),
+            pivot_action=(
+                "Ellenőrizd az aktuális állapotot read-only művelettel, majd válassz másik "
+                "megközelítést a tervben."
+            ),
+            patch="",
+            failed_action=failed_action[:2000],
+            corrective_action="",
+        )
+
+    async def sleep_backoff(self, attempt: int, code: str) -> None:
+        base = RATE_LIMIT_BACKOFF_SECONDS if code in MODEL_LONG_BACKOFF_CODES else BACKOFF_BASE_SECONDS
+        delay = min(BACKOFF_MAX_SECONDS, base * (2.0 ** max(0, attempt - 1)))
+        delay *= 0.8 + random.random() * 0.4
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeLimitFault()
+        delay = min(delay, max(0.1, remaining - 1.0))
+        try:
+            await asyncio.wait_for(self.cancel.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        if self.cancel.is_set():
+            raise AgentFault("CANCELLED", "A feladat megszakadt.", 499)
 
     def knowledge_text(self, retrieved: dict[str, Any], guidance: str) -> str:
         parts: list[str] = []
@@ -553,6 +839,114 @@ class AgentRuntime:
             ]
         )
 
+    def resume_briefing(self, checkpoint: Checkpoint) -> str:
+        trace_lines = [
+            f"- {item[:TRACE_COMPACT_CHARS]}" for item in checkpoint.trace[-12:]
+        ] or ["- nincs rögzített nyomvonal"]
+        lines = [
+            "[Rendszerüzenet] A feladat futása megszakadt, és mentett állapotból folytatom.",
+            f"Elvégzett modelllépések: {checkpoint.steps}; eszköz hívások: {checkpoint.call_count}.",
+            f"Aktuális terv: {checkpoint.plan or 'nincs rögzített terv'}",
+            "Legutóbbi nyomvonal:",
+            *trace_lines,
+        ]
+        if self.config.insta_key is not None:
+            lines.append(
+                "A korábbi VM és a benne létrehozott fájlok már nem elérhetők. A folytatáshoz "
+                "először állítsd vissza a szükséges munkakörnyezetet, és read-only művelettel "
+                "ellenőrizd az állapotot."
+            )
+        lines.append(
+            "A nyomvonal szerint már sikeresen elvégzett műveleteket ne ismételd meg; a félbeszakadt "
+            "műveletek kimenetele ismeretlen lehet, ezeket előbb ellenőrizd."
+        )
+        return "\n".join(lines)
+
+    def restore_state(self, checkpoint: Checkpoint) -> None:
+        self.steps = max(0, checkpoint.steps)
+        self.call_count = max(0, checkpoint.call_count)
+        self.verify_failures = checkpoint.verify_failures
+        self.replans = checkpoint.replans
+        self.verified = checkpoint.verified
+        self.sandbox_recreations = checkpoint.sandbox_recreations
+        self.step_retries = checkpoint.step_retries
+        self.loop_strikes = checkpoint.loop_strikes
+        self.uncertainty_strikes = checkpoint.uncertainty_strikes
+        self.plan.plan = checkpoint.plan
+        self.trace = [item[:TRACE_COMPACT_CHARS] for item in checkpoint.trace][-TRACE_MEMORY:]
+        restored: list[cog.Reflection] = []
+        for item in checkpoint.reflections:
+            record = as_dict(item)
+            restored.append(
+                cog.Reflection(
+                    failure_point=as_str(record.get("failure_point"))[:2000],
+                    component=as_str(record.get("component")) or "executor",
+                    root_cause=as_str(record.get("root_cause"))[:2000],
+                    pivot_action=as_str(record.get("pivot_action"))[:2000],
+                    patch=as_str(record.get("patch"))[:4000],
+                    failed_action=as_str(record.get("failed_action"))[:2000],
+                    corrective_action=as_str(record.get("corrective_action"))[:2000],
+                )
+            )
+        self.reflections = restored
+        if checkpoint.sigma:
+            try:
+                payload = dict(checkpoint.sigma)
+                payload.setdefault("objective", self.objective)
+                self.sigma = cog.maintain(cog.Sigma.from_dict(payload))
+            except Exception as exc:
+                logger.warning(
+                    "sigma_restore_failed", extra={"job_id": self.task_id, "error": str(exc)}
+                )
+        for entry in checkpoint.ledger:
+            self.step_ledger[entry.call_id] = entry
+            self.ledger_order.append(entry.call_id)
+        self.resumed = True
+
+    def restore_pending_step(self, checkpoint: Checkpoint) -> None:
+        calls = [call for call in checkpoint.pending_calls if call.id and call.name]
+        if not calls:
+            self.pending_response = None
+            self.step_appended = False
+            return
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments or "{}"},
+                    }
+                    for call in calls
+                ],
+            }
+        )
+        self.step_appended = True
+        self.pending_response = ModelResponse(
+            content="",
+            calls=[
+                ToolCall(
+                    id=call.id,
+                    type="function",
+                    function_name=call.name,
+                    function_arguments=call.arguments or "{}",
+                )
+                for call in calls
+            ],
+            finish="tool_calls",
+        )
+        for call in calls:
+            entry = self.step_ledger.get(call.id)
+            if entry is None:
+                continue
+            content = entry.content or "A művelet a megszakadás előtt lefutott; az eredmény nem ismert."
+            self.messages.append(
+                {"role": "tool", "tool_call_id": call.id, "content": content[:4000]}
+            )
+            self.appended_results.add(call.id)
+
     async def execute_tool(
         self,
         name: str,
@@ -567,6 +961,7 @@ class AgentRuntime:
                     str(args.get("task") or ""), context, self.cancel
                 )
             elif name == "consult_advisor":
+                self.advisor_calls += 1
                 payload = await subagents.consult_advisor(
                     str(args.get("question") or ""), context, self.cancel
                 )
@@ -634,6 +1029,40 @@ class AgentRuntime:
         raise RequestFault("Ismeretlen eszköz.", code="UNKNOWN_TOOL")
 
     async def run_tool_call(self, name: str, arguments: str) -> ToolOutput:
+        args: dict[str, Any] = {}
+        result = await self._invoke_tool(name, arguments, args)
+        code = as_str(as_dict(result.result).get("code"))
+        if (
+            result.status == ToolStatus.ERROR
+            and code in SANDBOX_RETRY_CODES
+            and self.sandbox is not None
+        ):
+            self.sandbox_faults += 1
+            idempotent = name in IDEMPOTENT_TOOLS
+            if idempotent or self.sandbox_faults >= 2:
+                if await self.recreate_sandbox(f"{name} → {code}"):
+                    self.sandbox_faults = 0
+                    if idempotent:
+                        result = await self._invoke_tool(name, arguments, args)
+        elif result.status == ToolStatus.COMPLETED:
+            self.sandbox_faults = 0
+        if name == "cloud_browser_start" and result.status == ToolStatus.COMPLETED:
+            browser_id = _browser_id_from(result)
+            if browser_id:
+                self.cloud_browsers.add(browser_id)
+                result.result["viewer_id"] = await cloud_browser.register_chat_browser(
+                    self.task_id, result.result
+                )
+        if name == "cloud_browser_stop" and result.status == ToolStatus.COMPLETED:
+            browser_id = as_str(args.get("browser_id"))
+            self.cloud_browsers.discard(browser_id)
+            if browser_id:
+                await cloud_browser.mark_chat_browser_stopped(browser_id)
+        return result
+
+    async def _invoke_tool(
+        self, name: str, arguments: str, args_out: dict[str, Any]
+    ) -> ToolOutput:
         try:
             if name not in self.enabled:
                 raise RequestFault("Ez az eszköz nem engedélyezett.", code="UNKNOWN_TOOL")
@@ -644,6 +1073,8 @@ class AgentRuntime:
                     "Eszközargumentum JSON hiba.", code="INVALID_ARGUMENT"
                 ) from exc
             args = validate_arguments(name, parsed_arguments)
+            args_out.clear()
+            args_out.update(args)
             if name == "reason":
                 tree = await cog.reason_tree(
                     await self.make_think(self.cancel, True, self.deadline),
@@ -669,32 +1100,18 @@ class AgentRuntime:
                         "blockers": self.sigma.blockers,
                     },
                 )
-            result = await self.execute_tool(
-                name,
-                args,
-                self.plan,
-                lambda value: self.send(
+
+            async def emit_plan(value: str) -> None:
+                await self.send(
                     {
                         "type": "agent_event",
                         "task_id": self.task_id,
                         "step": self.steps,
                         "event": {"type": "plan_update", "plan": value},
                     }
-                ),
-            )
-            if name == "cloud_browser_start" and result.status == ToolStatus.COMPLETED:
-                browser_id = _browser_id_from(result)
-                if browser_id:
-                    self.cloud_browsers.add(browser_id)
-                    result.result["viewer_id"] = await cloud_browser.register_chat_browser(
-                        self.task_id, result.result
-                    )
-            if name == "cloud_browser_stop" and result.status == ToolStatus.COMPLETED:
-                browser_id = str(args.get("browser_id") or "")
-                self.cloud_browsers.discard(browser_id)
-                if browser_id:
-                    await cloud_browser.mark_chat_browser_stopped(browser_id)
-            return result
+                )
+
+            return await self.execute_tool(name, args, self.plan, emit_plan)
         except AgentFault as fault:
             status = (
                 ToolStatus.UNKNOWN
@@ -712,10 +1129,113 @@ class AgentRuntime:
                 result={"code": "TOOL_FAILURE", "message": f"Eszközfuttatási hiba: {exc}"},
             )
 
+    async def recreate_sandbox(self, reason: str) -> bool:
+        if self.config.insta_key is None:
+            return False
+        limit = max(1, get_settings().agent_sandbox_recreate_max)
+        if self.sandbox_recreations >= limit:
+            await self.heal_note(
+                "önjavítás",
+                f"A VM újraindítása nem lehetséges, mert elértük a {limit} alkalmas keretet ({reason}).",
+            )
+            return False
+        previous = self.sandbox
+        self.sandbox = None
+        if previous is not None:
+            try:
+                await previous.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "sandbox_close_failed", extra={"job_id": self.task_id, "error": str(exc)}
+                )
+        self.sandbox = Sandbox(
+            self.config.insta_key,
+            self.config,
+            self.cancel,
+            self.deadline,
+            get_settings().instavm_url,
+        )
+        self.sandbox_recreations += 1
+        await self.heal_note(
+            "önjavítás",
+            f"Új VM lett indítva, mert a korábbi elakadt ({reason}). A korábbi fájlrendszer "
+            "elveszett; a szükséges fájlokat újra létre kell hozni.",
+        )
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "[Rendszerüzenet] A végrehajtó VM újra lett indítva, a korábbi fájlok és "
+                    "háttérfolyamatok elvesztek. Előbb állítsd vissza a munkakörnyezetet, "
+                    "read-only művelettel ellenőrizd az állapotot, és csak ezután folytasd a "
+                    "tervet. A már sikeresen elvégzett, külső hatású műveleteket ne ismételd meg."
+                ),
+            }
+        )
+        self.append_trace(f"VM ÚJRAINDÍTVA: {reason}")
+        await self.save_checkpoint("sandbox_recreated")
+        return True
+
+    async def probe_sandbox(self) -> None:
+        if self.sandbox is None or self.cancel.is_set():
+            return
+        try:
+            result = await self.sandbox.exec("true", "bash", 20)
+        except asyncio.CancelledError:
+            raise
+        except AgentFault as fault:
+            if fault.code in SANDBOX_RETRY_CODES:
+                await self.recreate_sandbox(f"állapotellenőrzés: {fault.code}")
+            return
+        except Exception as exc:
+            logger.warning(
+                "sandbox_probe_failed", extra={"job_id": self.task_id, "error": str(exc)}
+            )
+            await self.recreate_sandbox("az állapotellenőrzés váratlanul elakadt")
+            return
+        if result.status != ToolStatus.COMPLETED:
+            await self.recreate_sandbox("a VM nem válaszolt az állapotellenőrzésre")
+
+    async def advisor_rescue(self, tool: str, detail: str) -> str:
+        if "consult_advisor" not in self.enabled:
+            return ""
+        question = (
+            f"A végrehajtó ügynök a(z) {tool} eszközzel ismétlődő körbe akadt, és nem halad "
+            f"a cél felé. A részlet: {detail}. Adj egyetlen konkrét, más megközelítésű "
+            "következő lépést, és nevezd meg az ellenőrzés módját."
+        )
+        context = json.dumps(
+            {
+                "objective": self.objective[:4000],
+                "plan": self.plan.plan[:4000],
+                "sigma": self.sigma.to_dict(),
+                "trace": self.trace[-16:],
+            },
+            ensure_ascii=False,
+        )[:12_000]
+        try:
+            payload = await subagents.consult_advisor(question, context, self.cancel)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "advisor_rescue_failed", extra={"job_id": self.task_id, "error": str(exc)}
+            )
+            return ""
+        if as_str(payload.get("status")) != "completed":
+            return ""
+        advice = as_str(as_dict(payload.get("result")).get("advice")).strip()
+        return advice[:ADVICE_CHARS]
+
     async def consume_operator_messages(self, knowledge: str) -> None:
         try:
             operator_messages = await cog.take_operator_messages(self.task_id)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "operator_messages_failed", extra={"job_id": self.task_id, "error": str(exc)}
+            )
             operator_messages = []
         if not operator_messages:
             return
@@ -729,7 +1249,7 @@ class AgentRuntime:
                     ),
                 }
             )
-            self.trace.append(f"OPERÁTOR: {text}")
+            self.append_trace(f"OPERÁTOR: {text}")
             updated = self.sigma.copy()
             updated.facts.append(f"Operátor: {text}")
             self.sigma = cog.maintain(updated)
@@ -737,29 +1257,159 @@ class AgentRuntime:
         await self.lifecycle.to("osDeliberate")
         await self.replan(knowledge)
         await self.lifecycle.to("osAct")
+        await self.save_checkpoint("operator_message")
 
-    async def run_step(self, knowledge: str) -> TerminalState | None:
+    async def forward_step_event(self, event: dict[str, Any]) -> None:
+        if as_str(event.get("type")) != "delta":
+            await self.send(event)
+            return
+        raw = event.get("content")
+        if not isinstance(raw, str) or not raw:
+            raw = event.get("reasoning_content")
+        if not isinstance(raw, str) or not raw:
+            return
+        if self.gate.separator_pending:
+            self.gate.separator_pending = False
+            await self.send(
+                {
+                    "type": "delta",
+                    "task_id": self.task_id,
+                    "step": self.steps,
+                    "reasoning_content": RESTART_SEPARATOR,
+                }
+            )
+        text = self.gate.slice(raw)
+        if not text:
+            return
+        await self.send(
+            {
+                "type": "delta",
+                "task_id": self.task_id,
+                "step": self.steps,
+                "reasoning_content": text,
+            }
+        )
+
+    async def call_step_model(self) -> ModelResponse:
+        self.gate.begin_attempt()
         upstream = await call_model(
             self.config, self.messages, self.tools, self.cancel, self.deadline
         )
+        return await receive_model(
+            upstream, self.task_id, self.steps, self.forward_step_event, self.cancel
+        )
 
-        async def forward(event: dict[str, Any]) -> None:
-            if event.get("type") == "delta" and event.get("content"):
-                await self.send(
+    def tool_fingerprint(self, name: str, arguments: str, status: str, content: str) -> str:
+        digest = hashlib.sha256(
+            f"{name}|{arguments}|{status}|{content[:600]}".encode("utf-8")
+        ).hexdigest()[:20]
+        return f"{name}:{digest}"
+
+    def record_ledger(
+        self, call_id: str, fingerprint: str, tool: str, status: ToolStatus, content: str
+    ) -> None:
+        entry = LedgerEntry(
+            call_id=call_id,
+            fingerprint=fingerprint,
+            tool=tool,
+            status=status.value,
+            content=content[:4000],
+        )
+        if call_id not in self.step_ledger:
+            self.ledger_order.append(call_id)
+        self.step_ledger[call_id] = entry
+        while len(self.ledger_order) > LEDGER_LIMIT:
+            oldest = self.ledger_order.pop(0)
+            self.step_ledger.pop(oldest, None)
+
+    def reset_step(self) -> None:
+        self.pending_response = None
+        self.step_appended = False
+        self.step_ledger.clear()
+        self.ledger_order.clear()
+        self.appended_results.clear()
+
+    async def observe_repetition(
+        self, fingerprint: str, tool: str, knowledge: str
+    ) -> TerminalState | None:
+        settings = get_settings()
+        self.recent.append(fingerprint)
+        limit = max(2, settings.agent_loop_repeat_limit)
+        if self.recent.count(fingerprint) < limit:
+            return None
+        self.recent.clear()
+        self.loop_strikes += 1
+        strike = self.loop_strikes
+        detail = f"a(z) {tool} művelet {limit}-szer azonos eredménnyel ismétlődött"
+        if strike == 1:
+            await self.heal_note(
+                "önjavítás",
+                f"Ismétlődés észlelve: {detail}. Kényszerített reflexió és újratervezés.",
+            )
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[Rendszerüzenet] Ugyanaz a művelet azonos eredménnyel ismétlődik, így a "
+                        "feladat nem halad. Állj meg: ellenőrizd az állapotot read-only "
+                        "művelettel, majd válassz másik megközelítést, és frissítsd a tervet. "
+                        "Az ismétlés nem megoldás."
+                    ),
+                }
+            )
+            self.append_trace(f"ISMETLŐDÉS: {detail}")
+            await self.lifecycle.to("osReflect")
+            reflection = await self.safe_reflect(detail)
+            self.reflections.append(reflection)
+            self.pending_fix_index = len(self.reflections) - 1
+            await self.note("reflexió", format_reflection(reflection))
+            await self.lifecycle.to("osDeliberate")
+            await self.replan(knowledge)
+            await self.lifecycle.to("osAct")
+            await self.save_checkpoint("loop_strike")
+            return None
+        if strike == 2:
+            advice = await self.advisor_rescue(tool, detail)
+            if advice:
+                await self.heal_note(
+                    "önjavítás", "Külső tanácsadó bevonása az ismétlődő elakadás feloldására."
+                )
+                self.messages.append(
                     {
-                        "type": "delta",
-                        "task_id": event.get("task_id", self.task_id),
-                        "step": event.get("step", self.steps),
-                        "reasoning_content": event.get("content"),
+                        "role": "user",
+                        "content": (
+                            "[Rendszerüzenet] Külső tanácsadó válasza az ismétlődő elakadásra:\n"
+                            f"{advice}\nEzt a megközelítést kövesd, és az ismétlődő műveletet "
+                            "ne próbáld újra változtatás nélkül."
+                        ),
                     }
                 )
-                return
-            await self.send(event)
+                self.append_trace(f"TANÁCSADÓ: {advice[:TRACE_COMPACT_CHARS]}")
+                await self.lifecycle.to("osDeliberate")
+                await self.replan(knowledge)
+                await self.lifecycle.to("osAct")
+                await self.save_checkpoint("advisor_rescue")
+                return None
+        self.failure_reason = (
+            f"A végrehajtás {strike} alkalommal ismétlődő körbe akadt ({detail}); "
+            "a feladat nem halad tovább, ezért leállítom."
+        )
+        await self.heal_note("önjavítás", self.failure_reason)
+        return TerminalState.FAILED
 
-        received = await receive_model(upstream, self.task_id, self.steps, forward, self.cancel)
+    async def run_step(self, knowledge: str) -> TerminalState | None:
+        settings = get_settings()
+        if self.pending_response is None:
+            received = await self.call_step_model()
+            self.model_failures = 0
+            self.pending_response = received
+        received = self.pending_response
+        if received is None:
+            raise AgentFault("EMPTY_ANSWER", "A modell nem adott választ.", 502)
         if received.finish == "stop":
             if not received.content.strip():
                 raise AgentFault("EMPTY_ANSWER", "A modell nem adott befejező választ.", 502)
+            self.reset_step()
             await self.apply_deliberation(True)
             await self.lifecycle.to("osValidate")
             check = await cog.verify(self.sigma, self._probe)
@@ -782,21 +1432,17 @@ class AgentRuntime:
                 return TerminalState.COMPLETED
             self.verify_failures += 1
             await self.lifecycle.to("osReflect")
-            think = await self.make_think(self.cancel, True, self.deadline)
-            reflection = await cog.reflect(
-                think,
-                self.objective,
-                f"{self.trace_text()}\nVÁLASZ: {received.content[:2000]}\n"
-                f"ELLENŐRZÉSI HIBÁK: {'; '.join(check['failures'])}",
+            reflection = await self.safe_reflect(
                 f"befejezési kísérlet: {received.content[:500]}",
+                f"VÁLASZ: {received.content[:2000]}\n"
+                f"ELLENŐRZÉSI HIBÁK: {'; '.join(check['failures'])}",
             )
             self.reflections.append(reflection)
             self.pending_fix_index = len(self.reflections) - 1
             await self.note("reflexió", format_reflection(reflection))
             if self.verify_failures >= 3:
                 self.failure_reason = (
-                    "A külső célellenőrzés háromszor sikertelen: "
-                    + "; ".join(check["failures"])
+                    "A külső célellenőrzés háromszor sikertelen: " + "; ".join(check["failures"])
                 )
                 return TerminalState.FAILED
             self.messages.append({"role": "assistant", "content": received.content})
@@ -811,101 +1457,397 @@ class AgentRuntime:
                     ),
                 }
             )
-            self.trace.append(f"ELLENŐRZÉS SIKERTELEN: {'; '.join(check['failures'])}")
+            self.append_trace(f"ELLENŐRZÉS SIKERTELEN: {'; '.join(check['failures'])}")
             await self.lifecycle.to("osDeliberate")
             await self.replan(knowledge)
             await self.lifecycle.to("osAct")
+            await self.save_checkpoint("verify_failed")
             return None
         if (
             len(received.calls) > MAX_CALLS_PER_STEP
             or self.call_count + len(received.calls) > MAX_TOOL_CALLS
         ):
             raise StepLimitFault()
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": received.content,
-                "tool_calls": [
-                    {
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": call.function_name,
-                            "arguments": call.function_arguments,
-                        },
-                    }
-                    for call in received.calls
-                ],
-            }
-        )
+        if not self.step_appended:
+            self.messages.append(
+                {
+                    "role": "assistant",
+                    "content": received.content,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.function_name,
+                                "arguments": call.function_arguments,
+                            },
+                        }
+                        for call in received.calls
+                    ],
+                }
+            )
+            self.step_appended = True
+        uncertainty_limit = max(1, settings.agent_uncertainty_limit)
         for call in received.calls:
             self.remaining()
-            await cloud_browser.wait_for_browser_control(self.task_id, self.cancel)
-            self.call_count += 1
-            self.current_activity = tool_action_text(call.function_name)
-            await self.progress()
-            action_text = f"{call.function_name} {call.function_arguments}"[:2000]
-            await self.send(
-                {
-                    "type": "agent_event",
-                    "task_id": self.task_id,
-                    "step": self.steps,
-                    "event": {
-                        "type": "tool_start",
-                        "tool": call.function_name,
-                        "call_id": call.id,
-                        "input": call.function_arguments,
-                    },
-                }
-            )
-            result = await self.run_tool_call(
-                call.function_name, call.function_arguments
-            )
-            await cloud_browser.set_browser_agent_busy(self.task_id, False)
-            status, content = sanitize_result(result)
-            await self.send(
-                {
-                    "type": "agent_event",
-                    "task_id": self.task_id,
-                    "step": self.steps,
-                    "event": {
-                        "type": "tool_result",
-                        "tool": call.function_name,
-                        "call_id": call.id,
-                        "status": status.value,
-                        "output": content,
-                    },
-                }
-            )
-            self.trace.append(f"{action_text[:300]} => {status.value}: {content[:400]}")
-            if status == ToolStatus.COMPLETED and self.pending_fix_index is not None:
-                self.reflections[self.pending_fix_index].corrective_action = action_text
-                self.pending_fix_index = None
-            if status == ToolStatus.ERROR:
-                await self.lifecycle.to("osReflect")
-                think = await self.make_think(self.cancel, True, self.deadline)
-                reflection = await cog.reflect(
-                    think, self.objective, self.trace_text(), action_text
+            recorded = self.step_ledger.get(call.id)
+            if recorded is not None:
+                status = status_or_unknown(recorded.status)
+                content = recorded.content
+                await self.heal_note(
+                    "önjavítás",
+                    f"A(z) {call.function_name} hívás már lefutott ebben a lépésben, ezért "
+                    "a rögzített eredménnyel folytatom (nincs kettős végrehajtás).",
                 )
-                self.reflections.append(reflection)
-                self.pending_fix_index = len(self.reflections) - 1
-                reflection_text = format_reflection(reflection)
-                content += f"\nREFLEXIÓ:\n{reflection_text}"
-                await self.note("reflexió", reflection_text)
-                await self.lifecycle.to("osDeliberate")
-                await self.start_deliberation(knowledge)
-                await self.lifecycle.to("osAct")
-            self.messages.append(
-                {"role": "tool", "tool_call_id": call.id, "content": content}
-            )
+                if call.id not in self.appended_results:
+                    await self.send(
+                        {
+                            "type": "agent_event",
+                            "task_id": self.task_id,
+                            "step": self.steps,
+                            "event": {
+                                "type": "tool_result",
+                                "tool": call.function_name,
+                                "call_id": call.id,
+                                "status": status.value,
+                                "output": content,
+                                "replayed": True,
+                            },
+                        }
+                    )
+            else:
+                await cloud_browser.wait_for_browser_control(self.task_id, self.cancel)
+                self.call_count += 1
+                self.current_activity = tool_action_text(call.function_name)
+                await self.progress()
+                action_text = f"{call.function_name} {call.function_arguments}"[:2000]
+                await self.send(
+                    {
+                        "type": "agent_event",
+                        "task_id": self.task_id,
+                        "step": self.steps,
+                        "event": {
+                            "type": "tool_start",
+                            "tool": call.function_name,
+                            "call_id": call.id,
+                            "input": call.function_arguments,
+                        },
+                    }
+                )
+                result = await self.run_tool_call(call.function_name, call.function_arguments)
+                await cloud_browser.set_browser_agent_busy(self.task_id, False)
+                status, content = sanitize_result(result)
+                await self.send(
+                    {
+                        "type": "agent_event",
+                        "task_id": self.task_id,
+                        "step": self.steps,
+                        "event": {
+                            "type": "tool_result",
+                            "tool": call.function_name,
+                            "call_id": call.id,
+                            "status": status.value,
+                            "output": content,
+                        },
+                    }
+                )
+                fingerprint = self.tool_fingerprint(
+                    call.function_name, call.function_arguments, status.value, content
+                )
+                self.record_ledger(call.id, fingerprint, call.function_name, status, content)
+                self.append_trace(f"{action_text[:300]} => {status.value}: {content[:400]}")
+                if status == ToolStatus.COMPLETED and self.pending_fix_index is not None:
+                    self.reflections[self.pending_fix_index].corrective_action = action_text
+                    self.pending_fix_index = None
+                if status == ToolStatus.ERROR:
+                    await self.lifecycle.to("osReflect")
+                    reflection = await self.safe_reflect(action_text)
+                    self.reflections.append(reflection)
+                    self.pending_fix_index = len(self.reflections) - 1
+                    reflection_text = format_reflection(reflection)
+                    content += f"\nREFLEXIÓ:\n{reflection_text}"
+                    await self.note("reflexió", reflection_text)
+                    await self.lifecycle.to("osDeliberate")
+                    await self.start_deliberation(knowledge)
+                    await self.lifecycle.to("osAct")
+                    self.step_ledger[call.id] = LedgerEntry(
+                        call_id=call.id,
+                        fingerprint=self.tool_fingerprint(
+                            call.function_name, call.function_arguments, status.value, content
+                        ),
+                        tool=call.function_name,
+                        status=status.value,
+                        content=content[:4000],
+                    )
+            if call.id not in self.appended_results:
+                self.messages.append(
+                    {"role": "tool", "tool_call_id": call.id, "content": content}
+                )
+                self.appended_results.add(call.id)
             if status in (ToolStatus.UNKNOWN, ToolStatus.INTERRUPTED):
-                raise ToolUncertainFault()
+                self.uncertainty_strikes += 1
+                await self.heal_note(
+                    "önjavítás",
+                    f"A(z) {call.function_name} művelet kimenetele ismeretlen "
+                    f"({self.uncertainty_strikes}/{uncertainty_limit}); vak ismétlés helyett "
+                    "ellenőrzés szükséges.",
+                )
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[Rendszerüzenet] Az előző művelet kimenetele ismeretlen vagy "
+                            "megszakadt. Ne ismételd meg vakon: előbb read-only művelettel "
+                            "ellenőrizd a tényleges állapotot, és csak a megerősített tények "
+                            "után folytasd."
+                        ),
+                    }
+                )
+                self.append_trace(f"BIZONYTALAN KIMENETEL: {call.function_name}")
+                if self.uncertainty_strikes >= uncertainty_limit:
+                    raise ToolUncertainFault()
+                await self.save_checkpoint("uncertainty")
+            else:
+                self.uncertainty_strikes = 0
+            entry = self.step_ledger.get(call.id)
+            fingerprint = (
+                entry.fingerprint
+                if entry is not None
+                else self.tool_fingerprint(
+                    call.function_name, call.function_arguments, status.value, content
+                )
+            )
+            verdict = await self.observe_repetition(fingerprint, call.function_name, knowledge)
+            if verdict is not None:
+                return verdict
+        self.reset_step()
         return None
+
+    def classify_fault(self, fault: AgentFault) -> str:
+        code = fault.code
+        if code in FATAL_CODES or code in SANDBOX_FATAL_CODES:
+            return "fatal"
+        if code == "RUNTIME_LIMIT":
+            return "runtime"
+        if code == "CONTEXT_LIMIT":
+            return "context"
+        if code in MODEL_RETRY_CODES:
+            self.model_failures += 1
+            return "long_retry" if code in MODEL_LONG_BACKOFF_CODES else "retry"
+        if code in SANDBOX_RETRY_CODES:
+            if code == fault.code and self.last_fault_code == code:
+                self.fault_repeats += 1
+            else:
+                self.fault_repeats = 1
+            if self.fault_repeats >= 2 or self.sandbox_faults >= 2:
+                return "sandbox"
+            return "retry"
+        return "retry"
+
+    async def recover_context(self) -> bool:
+        before = self.budget.total(self.messages)
+        total, digest_index = compact_aggressive(
+            self.messages, self.budget, self.objective_index, self.trace
+        )
+        if digest_index < 0 or total >= before:
+            return False
+        self.context_recoveries += 1
+        self.objective_index = digest_index
+        await self.heal_note(
+            "önjavítás",
+            f"A kontextus {before} bájtról {total} bájtra lett tömörítve, a futás folytatódik.",
+        )
+        self.append_trace(f"KONTEXTUS TÖMÖRÍTVE: {before} → {total} bájt")
+        return True
+
+    async def run_step_guarded(self, knowledge: str) -> TerminalState | None:
+        settings = get_settings()
+        budget = max(1, settings.agent_step_retry_max)
+        attempt = 0
+        while True:
+            attempt += 1
+            self.remaining()
+            try:
+                return await self.run_step(knowledge)
+            except asyncio.CancelledError:
+                raise
+            except AgentFault as fault:
+                action = self.classify_fault(fault)
+                self.last_fault_code = fault.code
+                if action == "runtime":
+                    raise
+                if action == "fatal":
+                    raise
+                if attempt > budget:
+                    await self.heal_note(
+                        "önjavítás",
+                        f"A lépés {budget} újrapróbálkozás után sem sikerült ({fault.code}); "
+                        "a feladat leáll.",
+                    )
+                    raise
+                self.step_retries += 1
+                await self.heal_note(
+                    "önjavítás",
+                    f"A lépés átmeneti hiba miatt megszakadt ({fault.code}: {fault.message}). "
+                    f"Újrapróbálkozás: {attempt}/{budget}.",
+                )
+                self.append_trace(f"LÉPÉS ÚJRAPRÓBÁLVA ({attempt}/{budget}): {fault.code}")
+                self.gate.mark_interrupted()
+                await self.sleep_backoff(attempt, fault.code)
+                if action == "context":
+                    if not await self.recover_context():
+                        raise
+                elif action == "sandbox":
+                    if not await self.recreate_sandbox(fault.code):
+                        self.reset_step()
+                else:
+                    if self.model_failures >= 2 and "consult_advisor" in self.enabled:
+                        advice = await self.advisor_rescue(
+                            "modell", f"{fault.code}: {fault.message}"
+                        )
+                        if advice:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[Rendszerüzenet] A modell hívása átmenetileg akadt el. "
+                                        "Külső tanácsadó javaslata a folytatáshoz:\n"
+                                        f"{advice}"
+                                    ),
+                                }
+                            )
+                            self.model_failures = 0
+                if self.pending_response is None:
+                    self.gate.begin_attempt()
+                await self.save_checkpoint("step_retry")
+
+    def build_checkpoint(self) -> Checkpoint:
+        return Checkpoint(
+            version=CHECKPOINT_VERSION,
+            task_id=self.task_id,
+            steps=self.steps,
+            call_count=self.call_count,
+            objective=self.objective[:8000],
+            plan=self.plan.plan,
+            sigma=self.sigma.to_dict(),
+            trace=list(self.trace)[-60:],
+            reflections=[
+                {
+                    "failure_point": item.failure_point,
+                    "component": item.component,
+                    "root_cause": item.root_cause,
+                    "pivot_action": item.pivot_action,
+                    "patch": item.patch,
+                    "failed_action": item.failed_action,
+                    "corrective_action": item.corrective_action,
+                }
+                for item in self.reflections
+            ][-24:],
+            verify_failures=self.verify_failures,
+            replans=self.replans,
+            verified=self.verified,
+            message_count=len(self.messages),
+            step_appended=self.step_appended,
+            pending_calls=[
+                PendingCall(
+                    id=call.id, name=call.function_name, arguments=call.function_arguments
+                )
+                for call in (self.pending_response.calls if self.pending_response else [])
+            ],
+            ledger=[self.step_ledger[call_id] for call_id in self.ledger_order if call_id in self.step_ledger],
+            sandbox_recreations=self.sandbox_recreations,
+            step_retries=self.step_retries,
+            loop_strikes=self.loop_strikes,
+            uncertainty_strikes=self.uncertainty_strikes,
+        )
+
+    async def save_checkpoint(self, reason: str) -> None:
+        if not get_settings().agent_checkpoint_enabled or self.cancel.is_set():
+            return
+        try:
+            await checkpoints.save_checkpoint(self.build_checkpoint())
+            self.last_checkpoint_step = self.steps
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "checkpoint_failed",
+                extra={"job_id": self.task_id, "reason": reason, "error": str(exc)},
+            )
+
+    async def maybe_checkpoint(self, reason: str) -> None:
+        interval = max(1, get_settings().agent_checkpoint_interval_steps)
+        if not self.steps or self.steps % interval or self.steps == self.last_checkpoint_step:
+            return
+        await self.save_checkpoint(reason)
+
+    async def wrap_up(self, reason: str) -> str:
+        if self.wrapped_up:
+            return ""
+        self.wrapped_up = True
+        summary = ""
+        try:
+            think = await self.make_think(
+                self.cancel, False, time.monotonic() + WRAP_UP_TIMEOUT_SECONDS
+            )
+            summary = await think(
+                WRAP_UP_SYSTEM,
+                "\n\n".join(
+                    [
+                        f"CÉL: {self.objective[:4000]}",
+                        f"OK: {reason}",
+                        f"TERV: {self.plan.plan[:4000] or 'nincs'}",
+                        "MUNKAMEMÓRIA: "
+                        + json.dumps(self.sigma.to_dict(), ensure_ascii=False)[:6000],
+                        "NYOMVONAL VÉGE:\n" + self.trace_text()[:6000],
+                        f"LÉPÉSEK: {self.steps}; ESZKÖZ HÍVÁSOK: {self.call_count}.",
+                        "Írj magyar zárójelentést: mi készült el és hogyan ellenőrizhető, mi "
+                        "akadt el és miért, és pontosan mit kell tenni a folytatáshoz. "
+                        "Ne használj eszközöket.",
+                    ]
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "wrap_up_failed", extra={"job_id": self.task_id, "error": str(exc)}
+            )
+        summary = (summary or "").strip()[:SUMMARY_CHARS]
+        if summary and not self.cancel.is_set():
+            await self.send(
+                {
+                    "type": "delta",
+                    "task_id": self.task_id,
+                    "step": self.steps,
+                    "content": summary,
+                }
+            )
+        return summary
+
+    async def soft_deadline_check(self) -> tuple[TerminalState, str] | None:
+        margin = max(0.0, get_settings().agent_soft_deadline_margin_ms / 1000)
+        if self.verified or self.deadline - time.monotonic() > margin:
+            return None
+        reason = "A feladatra szánt időkeret lejár, ezért összefoglalom az elért állapotot."
+        await self.heal_note("önjavítás", reason)
+        await self.save_checkpoint("soft_deadline")
+        summary = await self.wrap_up(reason)
+        detail = reason if not summary else f"{reason} {summary[:400]}"
+        return TerminalState.RUNTIME_LIMIT, detail
 
     async def _probe(self, command: str) -> bool:
         if self.sandbox is None:
             return False
-        result = await self.sandbox.exec(command, "bash", 30)
+        try:
+            result = await self.sandbox.exec(command, "bash", 30)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "verify_probe_failed", extra={"job_id": self.task_id, "error": str(exc)}
+            )
+            return False
         return result.status == ToolStatus.COMPLETED
 
     async def run(self) -> TerminalState:
@@ -925,6 +1867,16 @@ class AgentRuntime:
             }
         ] + [dict(message) for message in self.history]
         self.objective_index = len(self.history)
+        checkpoint = self.checkpoint
+        if checkpoint is not None:
+            self.messages.append({"role": "user", "content": self.resume_briefing(checkpoint)})
+            self.objective_index = len(self.messages) - 1
+            self.restore_pending_step(checkpoint)
+            await self.heal_note(
+                "önjavítás",
+                f"A feladat mentett állapotból folytatódik a {checkpoint.steps}. lépéstől "
+                f"({checkpoint.call_count} eszköz hívás után).",
+            )
         outcome = TerminalState.FAILED
         reason = "A feladat befejezése nem ellenőrzött."
         self.verified = False
@@ -936,9 +1888,7 @@ class AgentRuntime:
             skill_result, guidance_result = await asyncio.gather(
                 cog.retrieve(
                     self.objective,
-                    "\n".join(
-                        str(item.get("content") or "") for item in self.history[-4:]
-                    ),
+                    "\n".join(str(item.get("content") or "") for item in self.history[-4:]),
                 ),
                 cog.policy_guidance(),
                 return_exceptions=True,
@@ -954,16 +1904,28 @@ class AgentRuntime:
         try:
             await load_knowledge()
             knowledge = self.knowledge_text(retrieved, guidance)
+            self.knowledge = knowledge
             await self.lifecycle.to("osDeliberate")
             await self.start_deliberation(knowledge)
             await self.lifecycle.to("osAct")
             await self.apply_deliberation(False)
+            probe_interval = max(1, settings.agent_sandbox_probe_interval_steps)
             while self.steps < MAX_STEPS:
+                wrap = await self.soft_deadline_check()
+                if wrap is not None:
+                    outcome, reason = wrap
+                    break
                 self.remaining()
                 await cloud_browser.wait_for_browser_control(self.task_id, self.cancel)
                 await cloud_browser.set_browser_agent_busy(self.task_id, False)
                 await self.consume_operator_messages(knowledge)
                 await self.apply_deliberation(False)
+                if (
+                    self.sandbox is not None
+                    and self.steps
+                    and self.steps % probe_interval == 0
+                ):
+                    await self.probe_sandbox()
                 if self.sigma.decision == "replan" and self.replans < 2:
                     self.replans += 1
                     await self.lifecycle.to("osDeliberate")
@@ -983,14 +1945,20 @@ class AgentRuntime:
                         self.cognition_text(knowledge),
                     ),
                 }
-                compact(self.messages, self.budget, self.objective_index)
+                try:
+                    compact(self.messages, self.budget, self.objective_index)
+                except ContextLimitFault:
+                    if not await self.recover_context():
+                        raise
+                    if self.budget.total(self.messages) > MAX_CONTEXT_BYTES:
+                        raise
                 self.current_activity = (
                     "A következő lépést dolgozom ki"
                     + (f"; eddig {self.call_count} műveletet végeztem" if self.steps else "")
                     + "."
                 )
                 await self.progress()
-                result = await self.run_step(knowledge)
+                result = await self.run_step_guarded(knowledge)
                 if result is not None:
                     outcome = result
                     reason = (
@@ -1000,12 +1968,24 @@ class AgentRuntime:
                     )
                     break
                 self.steps += 1
+                await self.maybe_checkpoint("step")
             else:
+                limit_reason = f"Elértük a {MAX_STEPS} modelllépés határát."
+                await self.heal_note("önjavítás", limit_reason)
+                await self.save_checkpoint("step_limit")
+                await self.wrap_up(limit_reason)
                 outcome = TerminalState.STEP_LIMIT
-                reason = f"Elértük a {MAX_STEPS} modelllépés határát."
+                reason = limit_reason
         except AgentFault as fault:
             if fault.code == "RUNTIME_LIMIT":
                 outcome = TerminalState.RUNTIME_LIMIT
+                limit_reason = fault.message
+                try:
+                    await self.wrap_up(limit_reason)
+                except Exception as exc:
+                    logger.warning(
+                        "wrap_up_failed", extra={"job_id": self.task_id, "error": str(exc)}
+                    )
             elif fault.code == "CONTEXT_LIMIT":
                 outcome = TerminalState.CONTEXT_LIMIT
             elif fault.code == "STEP_LIMIT":
@@ -1024,11 +2004,14 @@ class AgentRuntime:
                         "message": fault.message,
                     }
                 )
+            if outcome != TerminalState.CANCELLED:
+                await self.save_checkpoint("fault")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             outcome = TerminalState.FAILED
             reason = "Nem várt végrehajtási hiba."
+            logger.exception("runtime_failed", extra={"job_id": self.task_id})
             await self.send(
                 {
                     "type": "error",
@@ -1037,10 +2020,8 @@ class AgentRuntime:
                     "message": f"Nem várt végrehajtási hiba: {exc}",
                 }
             )
+            await self.save_checkpoint("internal_error")
         finally:
-            # A megszakítás nem szakíthatja meg ezt a takarítást: a felhőböngészőket
-            # minden esetben le kell állítani, különben futnak tovább és számlálnak.
-            # A felfogott megszakítást a blokk végén adjuk tovább.
             cancellation_error: asyncio.CancelledError | None = None
             progress_task.cancel()
             await asyncio.gather(progress_task, return_exceptions=True)
@@ -1081,6 +2062,8 @@ class AgentRuntime:
             if self.sandbox is not None:
                 try:
                     await self.sandbox.close()
+                except asyncio.CancelledError as exc:
+                    cancellation_error = cancellation_error or exc
                 except Exception:
                     if outcome == TerminalState.COMPLETED:
                         outcome = TerminalState.FAILED
@@ -1119,8 +2102,12 @@ class AgentRuntime:
                         },
                         lambda text: self.note("konszolidáció", text),
                     )
-                except Exception:
-                    pass
+                except asyncio.CancelledError as exc:
+                    cancellation_error = cancellation_error or exc
+                except Exception as exc:
+                    logger.warning(
+                        "consolidation_failed", extra={"job_id": self.task_id, "error": str(exc)}
+                    )
                 await self.send(
                     {
                         "type": "terminal",
@@ -1130,6 +2117,7 @@ class AgentRuntime:
                         "steps": self.steps,
                         "tool_calls": self.call_count,
                         "duration_ms": int((time.monotonic() - self.started) * 1000),
+                        "recovery": self.recovery_stats(),
                     }
                 )
                 await self.send(
@@ -1140,15 +2128,32 @@ class AgentRuntime:
                 raise cancellation_error
         return outcome
 
+    def recovery_stats(self) -> dict[str, Any]:
+        return {
+            "resumed": self.resumed,
+            "step_retries": self.step_retries,
+            "sandbox_recreations": self.sandbox_recreations,
+            "context_recoveries": self.context_recoveries,
+            "loop_strikes": self.loop_strikes,
+            "uncertainty_strikes": self.uncertainty_strikes,
+            "advisor_calls": self.advisor_calls,
+            "gate_restarts": self.gate.restarts,
+        }
+
     async def progress_loop(self) -> None:
         try:
             while True:
                 await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
                 await self.progress()
+                self.progress_ticks += 1
+                if self.progress_ticks % 4 == 0:
+                    await checkpoints.touch_checkpoint(self.task_id)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "progress_loop_failed", extra={"job_id": self.task_id, "error": str(exc)}
+            )
 
 
 async def run_durable_chat(
@@ -1157,6 +2162,7 @@ async def run_durable_chat(
     send: Sender,
     enqueue: Enqueuer,
     cancel: asyncio.Event,
+    checkpoint: Checkpoint | None = None,
 ) -> TerminalState:
     started = time.monotonic()
     try:
@@ -1179,5 +2185,7 @@ async def run_durable_chat(
         await send({"type": "done", "task_id": task_id, "outcome": "failed"})
         await enqueue("data: [DONE]\n\n")
         return TerminalState.FAILED
-    runtime = AgentRuntime(task_id, config, history, send, enqueue, cancel)
+    runtime = AgentRuntime(task_id, config, history, send, enqueue, cancel, checkpoint)
+    if checkpoint is not None:
+        runtime.restore_state(checkpoint)
     return await runtime.run()

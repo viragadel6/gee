@@ -19,6 +19,8 @@ RATE_LIMITS: dict[str, tuple[int, int]] = {
     "operator": (60, 60_000),
     "images": (20, 60_000),
     "public_worker": (120, 60_000),
+    "system": (120, 60_000),
+    "heal": (12, 60_000),
 }
 
 
