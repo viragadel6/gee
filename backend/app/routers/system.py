@@ -13,7 +13,8 @@ from app.errors import AgentFault, RateLimitFault, RequestFault
 from app.services.chat_jobs import job_queue_summary
 from app.services.checkpoints import checkpoint_stats
 from app.services.supervisor import RECOVERY_TABLE, heal_now, supervisor_status
-from app.utils.clock import as_int, as_str
+from app.utils.access import admin_error
+from app.utils.clock import as_int, as_list, as_str
 from app.utils.rate_limit import client_key, rate_limiter
 from app.utils.security import is_loose_uuid, verify_origin
 
@@ -31,11 +32,16 @@ LEGACY_JOB_COLUMNS = (
     "id, status, created_at, updated_at, started_at, lease_expires_at, stop_requested"
 )
 RECOVERY_COLUMNS = "id, job_id, kind, owner_id, detail, created_at"
+MISSING_COLUMN_CODES = frozenset({"42703", "PGRST204"})
+MISSING_TABLE_CODES = frozenset({"42P01", "PGRST106", "PGRST205"})
 MAX_JOB_ROWS = 50
 MAX_RECOVERY_ROWS = 50
 DEFAULT_JOB_ROWS = 25
 DEFAULT_RECOVERY_ROWS = 20
 DETAIL_CHARS = 400
+DEFAULT_RETRY_AFTER = 60
+MIN_RETRY_AFTER = 1
+MAX_RETRY_AFTER = 86_400
 
 
 def _json(payload: dict[str, Any], status_code: int = 200) -> JSONResponse:
@@ -48,43 +54,89 @@ def _failure(
     return _json({"error": {"code": code, "message": message}}, status_code)
 
 
+def _retry_after(exc: RateLimitFault) -> str:
+    raw = getattr(exc, "retry_after", None)
+    try:
+        seconds = int(raw) if raw is not None else DEFAULT_RETRY_AFTER
+    except (TypeError, ValueError, OverflowError):
+        seconds = DEFAULT_RETRY_AFTER
+    return str(min(MAX_RETRY_AFTER, max(MIN_RETRY_AFTER, seconds)))
+
+
 def _rate_limit_failure(exc: RateLimitFault) -> JSONResponse:
     return JSONResponse(
         status_code=429,
         content={"error": {"code": exc.code, "message": exc.message}},
-        headers={**NO_STORE, "Retry-After": str(exc.retry_after)},
+        headers={**NO_STORE, "Retry-After": _retry_after(exc)},
     )
 
 
-def _row_summary(row: dict[str, Any]) -> dict[str, Any]:
+def _admin_denied(request: Request) -> JSONResponse | None:
+    error = admin_error(request)
+    if error is None:
+        return None
+    message, status_code = error
+    return _failure(message, status_code, "ADMIN_ACCESS_DENIED")
+
+
+def _error_code(exc: DatabaseError) -> str:
+    return str(exc.code or "").strip().upper()
+
+
+def _error_message(exc: DatabaseError) -> str:
+    return str(exc.message or "").strip().lower()
+
+
+def _is_missing_column_error(exc: DatabaseError) -> bool:
+    if _error_code(exc) in MISSING_COLUMN_CODES:
+        return True
+    message = _error_message(exc)
+    return "column" in message and (
+        "does not exist" in message or "schema cache" in message or "not find" in message
+    )
+
+
+def _is_missing_table_error(exc: DatabaseError) -> bool:
+    if _error_code(exc) in MISSING_TABLE_CODES:
+        return True
+    message = _error_message(exc)
+    if "could not find the table" in message:
+        return True
+    return "relation" in message and "does not exist" in message
+
+
+def _row_summary(row: Any) -> dict[str, Any]:
+    record = row if isinstance(row, dict) else {}
     return {
-        "job_id": as_str(row.get("id")),
-        "status": as_str(row.get("status")),
-        "created_at": as_str(row.get("created_at")),
-        "updated_at": as_str(row.get("updated_at")),
-        "started_at": as_str(row.get("started_at")),
-        "lease_expires_at": as_str(row.get("lease_expires_at")),
-        "progress_at": as_str(row.get("progress_at")),
-        "next_attempt_at": as_str(row.get("next_attempt_at")),
-        "attempts": as_int(row.get("attempts")),
-        "last_error": as_str(row.get("last_error"), DETAIL_CHARS),
-        "stop_requested": bool(row.get("stop_requested")),
+        "job_id": as_str(record.get("id")),
+        "status": as_str(record.get("status")),
+        "created_at": as_str(record.get("created_at")),
+        "updated_at": as_str(record.get("updated_at")),
+        "started_at": as_str(record.get("started_at")),
+        "lease_expires_at": as_str(record.get("lease_expires_at")),
+        "progress_at": as_str(record.get("progress_at")),
+        "next_attempt_at": as_str(record.get("next_attempt_at")),
+        "attempts": as_int(record.get("attempts")),
+        "last_error": as_str(record.get("last_error"), DETAIL_CHARS),
+        "stop_requested": bool(record.get("stop_requested")),
     }
 
 
-def _recovery_summary(row: dict[str, Any]) -> dict[str, Any]:
+def _recovery_summary(row: Any) -> dict[str, Any]:
+    record = row if isinstance(row, dict) else {}
     return {
-        "id": as_int(row.get("id")),
-        "job_id": as_str(row.get("job_id")),
-        "kind": as_str(row.get("kind")),
-        "owner_id": as_str(row.get("owner_id")),
-        "detail": row.get("detail"),
-        "created_at": as_str(row.get("created_at")),
+        "id": as_int(record.get("id")),
+        "job_id": as_str(record.get("job_id")),
+        "kind": as_str(record.get("kind")),
+        "owner_id": as_str(record.get("owner_id")),
+        "detail": record.get("detail"),
+        "created_at": as_str(record.get("created_at")),
     }
 
 
 async def _recoverable_jobs(limit: int, job_id: str | None) -> list[dict[str, Any]]:
     database = database_module.get_admin_database()
+    last_error: DatabaseError | None = None
     for columns in (EXTENDED_JOB_COLUMNS, LEGACY_JOB_COLUMNS):
         try:
             query = database.table("chat_jobs").select(columns).in_(
@@ -96,66 +148,84 @@ async def _recoverable_jobs(limit: int, job_id: str | None) -> list[dict[str, An
                 query.order("updated_at", desc=False, nullsfirst=True).limit(limit).execute()
             )
         except DatabaseError as exc:
-            if exc.status_code in (400, 404) and columns == EXTENDED_JOB_COLUMNS:
+            if columns == EXTENDED_JOB_COLUMNS and _is_missing_column_error(exc):
+                last_error = exc
+                logger.warning(
+                    "system_jobs_legacy_columns", extra={"error": str(exc)}
+                )
                 continue
-            logger.warning("system_jobs_failed", extra={"error": str(exc)})
-            return []
-        except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning("system_jobs_failed", extra={"error": str(exc)})
-            return []
         return [_row_summary(row) for row in response.rows]
-    return []
+    if last_error is not None:
+        raise last_error
+    raise DatabaseError("A feladatok lekérdezése nem sikerült.", 500)
 
 
-async def _recovery_rows(limit: int) -> list[dict[str, Any]]:
+async def _recovery_rows(limit: int, job_id: str | None) -> list[dict[str, Any]]:
     database = database_module.get_admin_database()
     try:
-        response = await (
-            database.table(RECOVERY_TABLE)
-            .select(RECOVERY_COLUMNS)
-            .order("id", desc=True)
-            .limit(limit)
-            .execute()
-        )
+        query = database.table(RECOVERY_TABLE).select(RECOVERY_COLUMNS)
+        if job_id:
+            query = query.eq("job_id", job_id)
+        response = await query.order("id", desc=True).limit(limit).execute()
     except DatabaseError as exc:
-        if exc.status_code in (400, 404):
+        if _is_missing_table_error(exc) or _is_missing_column_error(exc):
+            logger.warning("system_recovery_log_unavailable", extra={"error": str(exc)})
             return []
-        logger.warning("system_recovery_failed", extra={"error": str(exc)})
-        return []
-    except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        logger.warning("system_recovery_failed", extra={"error": str(exc)})
-        return []
     return [_recovery_summary(row) for row in response.rows]
 
 
+async def _queue_summary() -> dict[str, Any]:
+    try:
+        summary = await job_queue_summary()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("system_queue_failed", extra={"error": str(exc)})
+        return {"available": False}
+    if not isinstance(summary, dict):
+        return {"available": False}
+    return summary
+
+
+def _checkpoint_summary() -> dict[str, Any]:
+    try:
+        stats = checkpoint_stats()
+    except Exception as exc:
+        logger.warning("system_checkpoints_failed", extra={"error": str(exc)})
+        return {"available": False}
+    if not isinstance(stats, dict):
+        return {"available": False}
+    return stats
+
+
 def _positive_limit(raw: str | None, fallback: int, ceiling: int) -> int:
-    value = as_int(raw if raw is not None else "", fallback, 1, ceiling)
-    return value
+    return as_int(raw if raw is not None else "", fallback, 1, ceiling)
 
 
 @router.get("/api/system/status")
 async def get_system_status(request: Request) -> Any:
     try:
+        denied = _admin_denied(request)
+        if denied is not None:
+            return denied
         rate_limiter.check("system", client_key(request))
         status = supervisor_status()
-        try:
-            status["queue"] = await job_queue_summary()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("system_queue_failed", extra={"error": str(exc)})
-            status["queue"] = {"error": str(exc)[:DETAIL_CHARS]}
-        status["checkpoints"] = checkpoint_stats()
-        status["recovery_log"] = await _recovery_rows(DEFAULT_RECOVERY_ROWS)
-        return _json(status)
+        payload: dict[str, Any] = dict(status) if isinstance(status, dict) else {}
+        payload["queue"] = await _queue_summary()
+        payload["checkpoints"] = _checkpoint_summary()
+        payload["recovery_log"] = await _recovery_rows(DEFAULT_RECOVERY_ROWS, None)
+        return _json(payload)
     except RateLimitFault as exc:
         return _rate_limit_failure(exc)
+    except RequestFault as exc:
+        return _failure(exc.message, exc.status_code, exc.code)
     except AgentFault as exc:
-        return _failure(exc.message, 400 if exc.status_code == 499 else exc.status_code, exc.code)
+        return _failure(exc.message, exc.status_code, exc.code)
+    except DatabaseError as exc:
+        logger.warning("system_status_database_failed", extra={"error": str(exc)})
+        return _failure("Az adatbázis nem érhető el.", 502, "DATABASE_ERROR")
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -166,6 +236,9 @@ async def get_system_status(request: Request) -> Any:
 @router.get("/api/system/jobs")
 async def get_system_jobs(request: Request) -> Any:
     try:
+        denied = _admin_denied(request)
+        if denied is not None:
+            return denied
         rate_limiter.check("system", client_key(request))
         limit = _positive_limit(
             request.query_params.get("limit"), DEFAULT_JOB_ROWS, MAX_JOB_ROWS
@@ -179,13 +252,19 @@ async def get_system_jobs(request: Request) -> Any:
         job_id = raw_job_id.strip()
         if job_id and not is_loose_uuid(job_id):
             raise RequestFault("Érvénytelen feladat azonosító.", code="INVALID_JOB_ID")
-        jobs = await _recoverable_jobs(limit, job_id)
-        recovery = await _recovery_rows(recovery_limit)
+        normalized_job_id = job_id or None
+        jobs = await _recoverable_jobs(limit, normalized_job_id)
+        recovery = await _recovery_rows(recovery_limit, normalized_job_id)
         return _json({"count": len(jobs), "jobs": jobs, "recovery_log": recovery})
     except RateLimitFault as exc:
         return _rate_limit_failure(exc)
+    except RequestFault as exc:
+        return _failure(exc.message, exc.status_code, exc.code)
     except AgentFault as exc:
-        return _failure(exc.message, 400 if exc.status_code == 499 else exc.status_code, exc.code)
+        return _failure(exc.message, exc.status_code, exc.code)
+    except DatabaseError as exc:
+        logger.warning("system_jobs_database_failed", extra={"error": str(exc)})
+        return _failure("Az adatbázis nem érhető el.", 502, "DATABASE_ERROR")
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -196,16 +275,26 @@ async def get_system_jobs(request: Request) -> Any:
 @router.post("/api/system/heal")
 async def post_system_heal(request: Request) -> Any:
     try:
+        denied = _admin_denied(request)
+        if denied is not None:
+            return denied
         origin_error = verify_origin(request)
         if origin_error is not None:
             return _failure(origin_error, 403, "INVALID_ORIGIN")
         rate_limiter.check("heal", client_key(request))
         result = await heal_now()
-        return _json({"healed": True, "result": result})
+        payload = result if isinstance(result, dict) else {}
+        healed = bool(payload.get("ok")) and not as_list(payload.get("errors"))
+        return _json({"healed": healed, "result": payload})
     except RateLimitFault as exc:
         return _rate_limit_failure(exc)
+    except RequestFault as exc:
+        return _failure(exc.message, exc.status_code, exc.code)
     except AgentFault as exc:
-        return _failure(exc.message, 400 if exc.status_code == 499 else exc.status_code, exc.code)
+        return _failure(exc.message, exc.status_code, exc.code)
+    except DatabaseError as exc:
+        logger.warning("system_heal_database_failed", extra={"error": str(exc)})
+        return _failure("Az adatbázis nem érhető el.", 502, "DATABASE_ERROR")
     except asyncio.CancelledError:
         raise
     except Exception:

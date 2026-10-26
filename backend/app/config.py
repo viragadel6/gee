@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     app_origins: str = ""
     app_origin: str = ""
 
+    session_secret: str = ""
+    admin_token: str = ""
+    worker_token: str = ""
+
     supabase_url: str = ""
     supabase_publishable_key: str = ""
     supabase_anon_key: str = ""
